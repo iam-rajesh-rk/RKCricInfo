@@ -393,6 +393,75 @@
 </head>
 <body>
 <div id="app"></div>
+
+<!-- ============== LIVE SYNC (Firebase Realtime Database) ==============
+     type="module" so it can use the modular Firebase SDK straight from a
+     CDN, no build step needed — works fine on GitHub Pages. Exposes a
+     small window.LiveSync API that the main app script below calls into.
+     Module scripts are deferred, so LiveSync may not exist for the first
+     few milliseconds of page load — the main script always checks
+     `window.LiveSync &&` before calling it, so that's safe. -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+  import { getDatabase, ref, set, onValue } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
+  import { getAuth, signInWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyBHbGMdqknxhzhyt2mmF727t1pKd_YsNI4",
+    authDomain: "rkcricinfo-2f1ec.firebaseapp.com",
+    databaseURL: "https://rkcricinfo-2f1ec-default-rtdb.asia-southeast1.firebasedatabase.app",
+    projectId: "rkcricinfo-2f1ec",
+    storageBucket: "rkcricinfo-2f1ec.firebasestorage.app",
+    messagingSenderId: "920097137213",
+    appId: "1:920097137213:web:2d8ca265a6b424ac98c054"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const db = getDatabase(app);
+  const auth = getAuth(app);
+
+  // Single shared match slot — fine for "one match happening at a time".
+  // If you ever run two matches in parallel, read a ?match=xyz param and
+  // use that as the path instead.
+  const MATCH_PATH = 'matches/current';
+
+  // Fixed scorer "account" that Database Rules check auth.uid against.
+  // This isn't a real person's email — it's just a login the scorer
+  // device signs into using the PIN. Create it once in the Firebase
+  // console (Authentication → Sign-in method → enable Email/Password,
+  // then Authentication → Users → Add user) with whatever password you
+  // want to use as your scoring PIN.
+  const SCORER_EMAIL = 'scorer@rkcricscore.local';
+
+  let writeTimer = null;
+
+  window.LiveSync = {
+    // Called after every render() on the scorer's device. Debounced so a
+    // burst of taps (e.g. undo spam) doesn't fire a write per tap.
+    push(matchState){
+      clearTimeout(writeTimer);
+      writeTimer = setTimeout(()=>{
+        set(ref(db, MATCH_PATH), matchState).catch(e=>{
+          console.warn('LiveSync: push failed (probably not signed in):', e.message);
+        });
+      }, 400);
+    },
+    // Viewer page calls this once; cb fires with the latest state every
+    // time the scorer pushes an update.
+    subscribe(cb){
+      onValue(ref(db, MATCH_PATH), (snap)=>{ cb(snap.val()); }, (err)=>{
+        console.warn('LiveSync: subscribe failed:', err.message);
+      });
+    },
+    async signIn(pin){
+      try{ await signInWithEmailAndPassword(auth, SCORER_EMAIL, pin); return true; }
+      catch(e){ return false; }
+    },
+    signOut(){ signOut(auth); },
+    isSignedIn(){ return !!auth.currentUser; }
+  };
+</script>
+
 <script>
 /* ============== STATE ============== */
 let M = null;
@@ -405,6 +474,10 @@ const STORAGE_KEY = 'crease_match_v1';
 const SQUADS_KEY  = 'crease_squads_v1';
 const PLAYER_LIBRARY_KEY = 'crease_player_library_v1';
 const GITHUB_SYNC_KEY = 'crease_github_sync_v1';
+
+/* ---- live viewer mode: ?view=1 on the URL means "read-only scoreboard" ---- */
+const VIEW_MODE = new URLSearchParams(location.search).get('view') === '1';
+let liveViewState = null; // populated by LiveSync.subscribe() when VIEW_MODE is true
 
 function freshMatch(){
   return {
@@ -598,6 +671,10 @@ function saveState(){
   try{
     localStorage.setItem(STORAGE_KEY, JSON.stringify({M, undoStack}));
   }catch(e){}
+  // Push to Firebase so viewers see live updates. Silently no-ops if
+  // LiveSync hasn't loaded yet or the scorer isn't signed in — Database
+  // Rules will reject the write and LiveSync logs a console warning.
+  if(!VIEW_MODE && window.LiveSync){ window.LiveSync.push(M); }
 }
 function loadState(){
   try{
@@ -1238,6 +1315,7 @@ function exportPDF(){
 function el(html){ const d=document.createElement('div'); d.innerHTML=html; return d.firstElementChild; }
 
 function render(){
+  if(VIEW_MODE) return renderViewerMode();
   saveState();
   const app = document.getElementById('app');
   app.innerHTML = '';
@@ -1252,6 +1330,52 @@ function render(){
   else if(M.stage==='finished') body = renderFinishedScreen();
   app.appendChild(body);
   if(modal) app.appendChild(renderModal());
+}
+
+/* ============== READ-ONLY LIVE VIEWER (?view=1) ==============
+   No scoring controls at all — just watches Firebase and redraws the
+   scoreboard whenever the scorer's device pushes an update. Reuses the
+   existing .scoreboard / .sb-* CSS classes already defined at the top
+   of the file, so it visually matches the rest of the app. */
+let liveViewerSubscribed = false;
+function renderViewerMode(){
+  const app = document.getElementById('app');
+  app.innerHTML = '';
+  const bar = el(`<div class="topbar">
+    <div class="brand"><div class="dot"></div><div><span>RKCricScore</span><small>Live</small></div></div>
+  </div>`);
+  app.appendChild(bar);
+
+  if(!liveViewerSubscribed && window.LiveSync){
+    liveViewerSubscribed = true;
+    window.LiveSync.subscribe((state)=>{ liveViewState = state; renderViewerMode(); });
+  }
+
+  if(!liveViewState){
+    app.appendChild(el(`<div class="wrap"><p class="hint">Waiting for live score…</p></div>`));
+    return;
+  }
+
+  const vm = liveViewState;
+  const inn = vm.innings && vm.innings[vm.curInnIdx];
+  if(!inn){
+    app.appendChild(el(`<div class="wrap"><p class="hint">Match hasn't started yet.</p></div>`));
+    return;
+  }
+  const sb = el(`<div class="scoreboard">
+    <div class="sb-top">
+      <div class="sb-team">${vm.teamNames[inn.battingTeam]}</div>
+      <div class="sb-innlabel">Inns ${vm.curInnIdx+1}</div>
+    </div>
+    <div class="sb-score">
+      <h2 style="font-size:40px;">${inn.totalRuns}/${inn.totalWkts}</h2>
+      <span style="color:var(--muted); font-size:16px;">(${oversStr(inn)} ov)</span>
+    </div>
+  </div>`);
+  app.appendChild(sb);
+  if(vm.resultText){
+    app.appendChild(el(`<div class="wrap"><div class="card"><b>${vm.resultText}</b><div class="hint">${vm.resultSub||''}</div></div></div>`));
+  }
 }
 
 function renderTopbar(){
@@ -1283,6 +1407,23 @@ function renderTopbar(){
   gh.textContent = githubCanWrite() ? '☁️ Synced' : '☁️ Sync';
   gh.onclick=()=>{modal={type:'githubSync'}; render();};
   btnWrap.appendChild(gh);
+
+  const live = document.createElement('button'); live.className='iconbtn';
+  const signedIn = window.LiveSync && window.LiveSync.isSignedIn();
+  live.textContent = signedIn ? '🟢 Live' : '🔒 Live off';
+  live.onclick = async ()=>{
+    if(!window.LiveSync){ alert('Live sync is still loading, try again in a second.'); return; }
+    if(signedIn){
+      if(confirm('Stop broadcasting live scores from this device?')){ window.LiveSync.signOut(); render(); }
+      return;
+    }
+    const pin = prompt('Enter scoring PIN to start broadcasting live:');
+    if(!pin) return;
+    const ok = await window.LiveSync.signIn(pin);
+    if(!ok) alert('Wrong PIN.');
+    render();
+  };
+  btnWrap.appendChild(live);
   return bar;
 }
 
