@@ -783,12 +783,16 @@ function recordRetired(kind){ // kind='hurt'|'out'
   modal = {type:'newBatsman', outEnd, retiredHurt: true};
   render();
 }
-function recordWide(){
+function recordWide(extraRuns){
+  extraRuns = extraRuns || 0;
   snapshot();
+  modal = null;
   const inn = curInn();
-  inn.totalRuns += 1; inn.extras.wd += 1;
-  inn.bowlStats[inn.bowlerId].runs += 1;
-  addTickerEvent(inn,'Wd','ext');
+  const total = 1 + extraRuns;
+  inn.totalRuns += total; inn.extras.wd += total;
+  inn.bowlStats[inn.bowlerId].runs += total;
+  addTickerEvent(inn, 'Wd'+(extraRuns?('+'+extraRuns):''), 'ext');
+  swapStrikeIfOdd(inn, extraRuns);
   finalizeNonLegalDelivery();
 }
 function recordNoBall(offBat){
@@ -1688,7 +1692,7 @@ function renderPlayingScreen(){
   actions.appendChild(runsRow2);
 
   const extrasRow = el('<div class="grid4"></div>');
-  const wd = el('<button class="xbtn">Wide</button>'); wd.onclick=recordWide;
+  const wd = el('<button class="xbtn">Wide</button>'); wd.onclick=()=>{ modal={type:'wideRuns'}; render(); };
   const nb = el('<button class="xbtn">No Ball</button>'); nb.onclick=()=>{ modal={type:'noballRuns'}; render(); };
   const bye = el('<button class="xbtn">Bye</button>'); bye.onclick=()=>{ modal={type:'extraRuns', kind:'b'}; render(); };
   const lb = el('<button class="xbtn">Leg Bye</button>'); lb.onclick=()=>{ modal={type:'extraRuns', kind:'lb'}; render(); };
@@ -1765,6 +1769,16 @@ function renderModal(){
     [0,1,2,3,4,6].forEach(r=>{
       const b = el(`<button class="opt-btn">${r}</button>`);
       b.onclick = ()=>{ recordNoBall(r); };
+      grid.appendChild(b);
+    });
+    m.appendChild(grid);
+  }
+  else if(modal.type==='wideRuns'){
+    m.appendChild(el('<h3>Wide — additional runs</h3>'));
+    const grid = el('<div class="opt-grid" style="grid-template-columns:repeat(4,1fr);"></div>');
+    [0,1,2,3,4,6].forEach(r=>{
+      const b = el(`<button class="opt-btn">${r}</button>`);
+      b.onclick = ()=>{ recordWide(r); };
       grid.appendChild(b);
     });
     m.appendChild(grid);
