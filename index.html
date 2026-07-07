@@ -774,6 +774,26 @@ async function pushScorecardToGithub(blob, baseName){
 }
 
 
+/* Guarantees a complete, well-shaped match object no matter where it came
+   from (an old localStorage save from a previous version of the app, or a
+   match pulled down from Firebase). Missing/malformed top-level fields
+   fall back to freshMatch() defaults instead of crashing the first time
+   the app tries to write to them (e.g. M.teamNames.A = ...). */
+function normalizeMatch(m){
+  const base = freshMatch();
+  if(!m || typeof m !== 'object') return base;
+  const out = Object.assign({}, base, m);
+  out.teamNames = Object.assign({}, base.teamNames, (m.teamNames && typeof m.teamNames==='object') ? m.teamNames : {});
+  out.squads = Object.assign({}, base.squads, (m.squads && typeof m.squads==='object') ? m.squads : {});
+  out.toss = Object.assign({}, base.toss, (m.toss && typeof m.toss==='object') ? m.toss : {});
+  out.oversPerInnings = Array.isArray(m.oversPerInnings) && m.oversPerInnings.length===2
+    ? m.oversPerInnings
+    : (m.oversLimit ? [m.oversLimit, m.oversLimit] : base.oversPerInnings);
+  out.innings = Array.isArray(m.innings) ? m.innings : [];
+  out.stage = m.stage || base.stage;
+  return out;
+}
+
 /* ---- match persistence ---- */
 function saveState(){
   try{
@@ -790,13 +810,7 @@ function loadState(){
     if(!raw) return false;
     const parsed = JSON.parse(raw);
     if(!parsed || !parsed.M) return false;
-    M = parsed.M;
-    if(!M.toss) M.toss = { callingTeam:null, call:null, result:null, winner:null, choice:null };
-    // migrate old single "oversLimit" matches to per-innings overs
-    if(!M.oversPerInnings){
-      const legacy = M.oversLimit || 20;
-      M.oversPerInnings = [legacy, legacy];
-    }
+    M = normalizeMatch(parsed.M);
     undoStack = parsed.undoStack || [];
     return true;
   }catch(e){ return false; }
@@ -848,6 +862,7 @@ function rrr(inn){
 
 /* ============== SETUP ============== */
 function startMatchFromForm(){
+  M = normalizeMatch(M); // defensive: guard against a malformed M from an old save or bad sync
   const an = document.getElementById('teamAName').value.trim() || 'Team A';
   const bn = document.getElementById('teamBName').value.trim() || 'Team B';
   const ap = parsePlayers(document.getElementById('teamAPlayers').value);
@@ -1819,7 +1834,7 @@ function renderTopbar(){
           'Load it onto this device and continue scoring? (Your current unsent match on this device will be replaced.)'
         );
         if(takeOver){
-          M = remote;
+          M = normalizeMatch(remote);
           undoStack = []; // no shared undo history across devices
         }
       }
