@@ -424,8 +424,9 @@
      `window.LiveSync &&` before calling it, so that's safe. -->
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-  import { getDatabase, ref, set, onValue } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
+  import { getDatabase, ref, set, get, onValue, push } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
   import { getAuth, signInWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+  import { getStorage, ref as storageRef, uploadBytes, getDownloadURL } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyBHbGMdqknxhzhyt2mmF727t1pKd_YsNI4",
@@ -440,11 +441,17 @@
   const app = initializeApp(firebaseConfig);
   const db = getDatabase(app);
   const auth = getAuth(app);
+  const storage = getStorage(app);
 
   // Single shared match slot — fine for "one match happening at a time".
   // If you ever run two matches in parallel, read a ?match=xyz param and
   // use that as the path instead.
   const MATCH_PATH = 'matches/current';
+  // Where finished-match scorecard PDFs get uploaded (Firebase Storage),
+  // and where an index of them (with download URLs) is kept (Realtime DB)
+  // so past matches can be browsed later.
+  const SCORECARDS_STORAGE_DIR = 'scorecards';
+  const SCORECARDS_INDEX_PATH = 'scorecards_index';
 
   // Fixed scorer "account" that Database Rules check auth.uid against.
   // This isn't a real person's email — it's just a login the scorer
@@ -474,12 +481,47 @@
         console.warn('LiveSync: subscribe failed:', err.message);
       });
     },
+    // One-off read of whatever match state is currently live in Firebase.
+    // Used when a second device enables Live so it can pick up the match
+    // already in progress (instead of overwriting it with a blank one).
+    // Returns null if nothing is live yet, or on error.
+    async pullOnce(){
+      try{
+        const snap = await get(ref(db, MATCH_PATH));
+        return snap.exists() ? snap.val() : null;
+      }catch(e){
+        console.warn('LiveSync: pull failed:', e.message);
+        return null;
+      }
+    },
     async signIn(pin){
       try{ await signInWithEmailAndPassword(auth, SCORER_EMAIL, pin); return true; }
       catch(e){ return false; }
     },
     signOut(){ signOut(auth); },
-    isSignedIn(){ return !!auth.currentUser; }
+    isSignedIn(){ return !!auth.currentUser; },
+    // Uploads a finished match's scorecard PDF (Blob) to Firebase Storage
+    // and records it (with a download URL) in the Realtime Database so it
+    // can be found again later. Requires the device to be signed in (Live
+    // must be turned on) — Storage/Database rules should mirror that.
+    // `meta` is a small plain object (team names, result text, etc.) —
+    // passed in by the caller since this module can't see the app's `M`.
+    async uploadScorecard(blob, baseName, meta){
+      if(!auth.currentUser) throw new Error('Turn on Live (with the PIN) first, so this device is signed in.');
+      const path = SCORECARDS_STORAGE_DIR+'/'+baseName+'.pdf';
+      const fileRef = storageRef(storage, path);
+      await uploadBytes(fileRef, blob, {contentType:'application/pdf'});
+      const url = await getDownloadURL(fileRef);
+      try{
+        await push(ref(db, SCORECARDS_INDEX_PATH), Object.assign({}, meta||{}, {
+          url, storagePath: path, savedAt: Date.now()
+        }));
+      }catch(e){
+        // Index entry is best-effort — the PDF itself is already safely uploaded.
+        console.warn('LiveSync: scorecard index write failed:', e.message);
+      }
+      return url;
+    }
   };
 </script>
 
@@ -1017,6 +1059,7 @@ function checkInningsEnd(){
     } else {
       M.stage = 'finished';
       computeResult();
+      autoPushFinishedScorecardToFirebase();
     }
   }
   return ended;
@@ -1195,6 +1238,34 @@ function deliverFile(blob, fname, mime){
   }
 }
 
+/* Best-effort, silent push of the final scorecard PDF into Firebase the
+   moment a match finishes — only if this device is already Live-signed-in
+   (i.e. the scorer opted into live sync). Builds the scorecard off-screen
+   so it doesn't require the export overlay to be open. Never throws —
+   if it fails (offline, not signed in, etc.) the scorer can still use the
+   manual "Save scorecard to Firebase" button from the Scorecard screen. */
+async function autoPushFinishedScorecardToFirebase(){
+  if(VIEW_MODE || !(window.LiveSync && window.LiveSync.isSignedIn())) return;
+  const holder = document.createElement('div');
+  holder.className = 'rk-pdf-source';
+  holder.style.cssText = 'position:fixed; left:-9999px; top:0; width:800px;';
+  try{
+    holder.innerHTML = buildScorecardHTML();
+    document.body.appendChild(holder);
+    const baseName = scorecardFilename().replace(/\.html$/,'');
+    const blob = await renderScorecardToPDFBlob(holder, baseName);
+    if(!blob) return;
+    await window.LiveSync.uploadScorecard(blob, baseName, {
+      teamA: M.teamNames.A, teamB: M.teamNames.B,
+      resultText: M.resultText||'', resultSub: M.resultSub||''
+    });
+  }catch(e){
+    console.warn('Auto scorecard upload to Firebase failed:', e.message);
+  }finally{
+    holder.remove();
+  }
+}
+
 /* Main export — generates a real PDF and hands it to the user via the Web
    Share API where available, falling back to a direct save/open. */
 function exportPDF(){
@@ -1311,6 +1382,41 @@ function exportPDF(){
     ghHint.style.cssText = 'font-size:11px; color:#888; text-align:center; margin:0 0 8px;';
     ghHint.textContent = 'Tip: set up ☁️ GitHub Sync (top bar) to push this scorecard straight into your repo.';
     overlay.appendChild(ghHint);
+  }
+
+  /* ── Save to Firebase (only meaningful if this device is Live-signed-in) ── */
+  if(window.LiveSync && window.LiveSync.isSignedIn()){
+    const fbBtn = document.createElement('button');
+    fbBtn.className = 'pr-print-btn';
+    fbBtn.style.background = '#FFB23F'; fbBtn.style.color = '#111';
+    fbBtn.textContent = '🔥 Save scorecard to Firebase';
+    fbBtn.setAttribute('ontouchstart','');
+    fbBtn.onclick = async ()=>{
+      const originalLabel = fbBtn.textContent;
+      fbBtn.disabled = true;
+      fbBtn.textContent = '⏳ Uploading…';
+      try{
+        const baseName = scorecardFilename().replace(/\.html$/,'');
+        const previewEl = overlay.querySelector('.rk-pdf-source');
+        const blob = await renderScorecardToPDFBlob(previewEl, baseName);
+        if(!blob) throw new Error('Could not generate the PDF (no internet? html2pdf failed to load)');
+        await window.LiveSync.uploadScorecard(blob, baseName, {
+          teamA: M.teamNames.A, teamB: M.teamNames.B,
+          resultText: M.resultText||'', resultSub: M.resultSub||''
+        });
+        fbBtn.textContent = '✅ Saved to Firebase';
+      }catch(e){
+        fbBtn.textContent = '❌ '+e.message;
+        fbBtn.disabled = false;
+        setTimeout(()=>{ fbBtn.textContent = originalLabel; }, 4000);
+      }
+    };
+    overlay.appendChild(fbBtn);
+  } else {
+    const fbHint = document.createElement('p');
+    fbHint.style.cssText = 'font-size:11px; color:#888; text-align:center; margin:0 0 8px;';
+    fbHint.textContent = 'Tip: turn on 🟢 Live (top bar, with the PIN) to push this scorecard straight into Firebase.';
+    overlay.appendChild(fbHint);
   }
 
   /* ── Close ── */
@@ -1442,7 +1548,25 @@ function renderTopbar(){
     const pin = prompt('Enter scoring PIN to start broadcasting live:');
     if(!pin) return;
     const ok = await window.LiveSync.signIn(pin);
-    if(!ok) alert('Wrong PIN.');
+    if(!ok){ alert('Wrong PIN.'); render(); return; }
+    // This device is now signed in. If a match is already live in Firebase
+    // (e.g. started from another device), pull it down so this device
+    // shows the current live score and can carry on updating it — instead
+    // of silently starting a brand-new blank match and overwriting it.
+    try{
+      const remote = await window.LiveSync.pullOnce();
+      if(remote && remote.teamNames){
+        const localInProgress = M.stage!=='setup';
+        const takeOver = !localInProgress || confirm(
+          'A live match is already running on Firebase ('+remote.teamNames.A+' vs '+remote.teamNames.B+').\n\n'+
+          'Load it onto this device and continue scoring? (Your current unsent match on this device will be replaced.)'
+        );
+        if(takeOver){
+          M = remote;
+          undoStack = []; // no shared undo history across devices
+        }
+      }
+    }catch(e){ console.warn('Could not check for an existing live match:', e.message); }
     render();
   };
   btnWrap.appendChild(live);
@@ -2092,7 +2216,7 @@ function renderModal(){
       const inn = curInn();
       inn.done = true;
       undoStack = []; // clear history so it can't leak into the next innings
-      if(M.curInnIdx===0){ M.stage='between'; } else { M.stage='finished'; computeResult(); }
+      if(M.curInnIdx===0){ M.stage='between'; } else { M.stage='finished'; computeResult(); autoPushFinishedScorecardToFirebase(); }
       modal=null; render();
     };
     const no = el('<button class="modal-close">Cancel</button>');
