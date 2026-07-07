@@ -779,6 +779,23 @@ async function pushScorecardToGithub(blob, baseName){
    match pulled down from Firebase). Missing/malformed top-level fields
    fall back to freshMatch() defaults instead of crashing the first time
    the app tries to write to them (e.g. M.teamNames.A = ...). */
+/* Firebase Realtime Database silently drops any nested field whose value
+   is an empty object ({}) when writing — there's no way to represent "an
+   empty object" vs "nothing here" in its JSON tree. A freshly-started
+   innings has batsStats/bowlStats/fieldingStats all as {} for the instant
+   before the first ball, so if a device pulls the match down from
+   Firebase right then, those keys can come back missing entirely. This
+   repairs an innings object pulled from Firebase (or an old save) so
+   every field the scoring code expects is always at least an empty {}. */
+function normalizeInnings(inn){
+  if(!inn || typeof inn !== 'object') return inn;
+  inn.batsStats = (inn.batsStats && typeof inn.batsStats==='object') ? inn.batsStats : {};
+  inn.bowlStats = (inn.bowlStats && typeof inn.bowlStats==='object') ? inn.bowlStats : {};
+  inn.fieldingStats = (inn.fieldingStats && typeof inn.fieldingStats==='object') ? inn.fieldingStats : {};
+  inn.extras = Object.assign({wd:0,nb:0,b:0,lb:0}, (inn.extras && typeof inn.extras==='object') ? inn.extras : {});
+  inn.thisOverEvents = Array.isArray(inn.thisOverEvents) ? inn.thisOverEvents : [];
+  return inn;
+}
 function normalizeMatch(m){
   const base = freshMatch();
   if(!m || typeof m !== 'object') return base;
@@ -789,7 +806,7 @@ function normalizeMatch(m){
   out.oversPerInnings = Array.isArray(m.oversPerInnings) && m.oversPerInnings.length===2
     ? m.oversPerInnings
     : (m.oversLimit ? [m.oversLimit, m.oversLimit] : base.oversPerInnings);
-  out.innings = Array.isArray(m.innings) ? m.innings : [];
+  out.innings = (Array.isArray(m.innings) ? m.innings : []).map(normalizeInnings);
   out.stage = m.stage || base.stage;
   return out;
 }
@@ -1704,7 +1721,7 @@ function renderViewerMode(){
 
   if(!liveViewerSubscribed && window.LiveSync){
     liveViewerSubscribed = true;
-    window.LiveSync.subscribe((state)=>{ liveViewState = state; if(!viewerShowScorecards) renderViewerMode(); });
+    window.LiveSync.subscribe((state)=>{ liveViewState = state ? normalizeMatch(state) : state; if(!viewerShowScorecards) renderViewerMode(); });
   }
 
   if(viewerShowScorecards){
