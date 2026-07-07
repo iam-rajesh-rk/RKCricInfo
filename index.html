@@ -126,7 +126,7 @@
   }
   .btn-primary:active{opacity:0.8;}
   .btn-ghost{
-    width:100%; background:transparent; color:var(--text); border:1px solid var(--border);
+    width:100%; background:var(--surface2); color:var(--text); border:1px solid var(--border);
     border-radius:12px; padding:14px; font-family:'Inter',sans-serif; font-weight:600; font-size:16px;
     cursor:pointer; margin-top:10px; min-height:52px; touch-action:manipulation;
   }
@@ -155,6 +155,27 @@
   .sb-overs{font-family:'JetBrains Mono',monospace; font-size:13px; color:var(--muted); margin-top:2px;}
   .sb-meta{display:flex; gap:18px; margin-top:12px; font-family:'JetBrains Mono',monospace; font-size:12px; color:var(--muted);}
   .sb-meta b{color:var(--text); font-weight:700;}
+  /* High-contrast outdoor viewer mode (?view=1) — scorer view is untouched */
+  body.viewer-mode{background:#000;}
+  body.viewer-mode .topbar{background:#000; border-bottom:2px solid var(--lime);}
+  body.viewer-mode .brand small{color:#FFD400;}
+  body.viewer-mode .scoreboard{
+    background:#000; border:3px solid var(--lime); border-radius:16px;
+    margin:14px; padding:22px;
+    box-shadow:0 0 24px rgba(212,255,79,0.25);
+  }
+  body.viewer-mode .sb-team{font-size:20px; font-weight:700; color:#FFFFFF; letter-spacing:0.06em;}
+  body.viewer-mode .sb-innlabel{font-size:15px; color:#FFD400; font-weight:700;}
+  body.viewer-mode .sb-score h2{
+    font-size:76px !important; font-weight:800; color:var(--lime) !important;
+    text-shadow:0 0 14px rgba(212,255,79,0.5); letter-spacing:0.01em;
+  }
+  body.viewer-mode .sb-score span{
+    font-size:24px !important; color:#FFFFFF !important; font-weight:700;
+  }
+  body.viewer-mode .hint{font-size:20px; color:#FFFFFF; font-weight:600;}
+  body.viewer-mode .card{background:#000; border:2px solid var(--lime);}
+  body.viewer-mode .card b{font-size:22px; color:var(--lime);}
   .sb-target{
     margin-top:12px; padding-top:12px; border-top:1px dashed var(--border);
     font-size:12px; color:var(--amber); font-family:'JetBrains Mono',monospace;
@@ -477,6 +498,7 @@ const GITHUB_SYNC_KEY = 'crease_github_sync_v1';
 
 /* ---- live viewer mode: ?view=1 on the URL means "read-only scoreboard" ---- */
 const VIEW_MODE = new URLSearchParams(location.search).get('view') === '1';
+if(VIEW_MODE){ document.body.classList.add('viewer-mode'); }
 let liveViewState = null; // populated by LiveSync.subscribe() when VIEW_MODE is true
 
 function freshMatch(){
