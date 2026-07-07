@@ -318,6 +318,14 @@
   }
   .result-banner h2{font-size:22px; color:var(--lime); margin-bottom:6px;}
   .result-banner p{color:var(--muted); font-size:14px; margin:0;}
+  .awards-block{
+    background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+    padding:14px 16px; margin:0 16px 14px;
+  }
+  .award-row{display:flex; justify-content:space-between; align-items:baseline; gap:10px; padding:7px 0; border-bottom:1px solid var(--border);}
+  .award-row:last-child{border-bottom:none;}
+  .award-label{font-family:'Oswald',sans-serif; font-size:12px; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); white-space:nowrap;}
+  .award-val{font-size:13px; font-weight:600; text-align:right;}
   table{width:100%; border-collapse:collapse; font-size:12px;}
   th,td{text-align:left; padding:8px 6px; border-bottom:1px solid var(--border);}
   th{color:var(--mutedDark); text-transform:uppercase; font-size:10px; letter-spacing:0.05em;}
@@ -410,6 +418,11 @@
   .pr-result{ font-size:16px; font-weight:700; color:#1a5c1a !important; padding:10px 0 2px; }
   .pr-result-sub{ font-size:12px; color:#444 !important; padding:0 0 12px; }
   .pr-footer{ font-size:9px; color:#999 !important; border-top:1px solid #eee; padding:8px 0; margin-top:8px; }
+  .pr-awards{ margin:2px 0 12px; }
+  .pr-award-row{ display:flex; justify-content:space-between; align-items:baseline; gap:10px; padding:5px 0; border-bottom:1px solid #eee; }
+  .pr-award-row:last-child{ border-bottom:none; }
+  .pr-award-label{ font-size:10px; text-transform:uppercase; letter-spacing:.05em; color:#666 !important; white-space:nowrap; }
+  .pr-award-val{ font-size:12px; font-weight:700; color:#111 !important; text-align:right; }
 </style>
 </head>
 <body>
@@ -425,7 +438,7 @@
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
   import { getDatabase, ref, set, get, onValue, push } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
-  import { getAuth, signInWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+  import { getAuth, signInWithEmailAndPassword, signInAnonymously, signOut } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
   import { getStorage, ref as storageRef, uploadBytes, getDownloadURL } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js";
 
   const firebaseConfig = {
@@ -463,6 +476,15 @@
 
   let writeTimer = null;
 
+  // Makes sure *some* auth session exists before a read, so Database Rules
+  // requiring `auth != null` don't block viewers who never enter the PIN.
+  // No-ops if already signed in (as scorer or anonymously).
+  async function ensureReadAccess(){
+    if(auth.currentUser) return;
+    try{ await signInAnonymously(auth); }
+    catch(e){ console.warn('LiveSync: anonymous sign-in failed:', e.message); }
+  }
+
   window.LiveSync = {
     // Called after every render() on the scorer's device. Debounced so a
     // burst of taps (e.g. undo spam) doesn't fire a write per tap.
@@ -475,8 +497,12 @@
       }, 400);
     },
     // Viewer page calls this once; cb fires with the latest state every
-    // time the scorer pushes an update.
-    subscribe(cb){
+    // time the scorer pushes an update. Viewers never enter the scoring
+    // PIN, so this signs them in anonymously first — otherwise Database
+    // Rules that require `auth != null` would block the read and the
+    // viewer screen would sit on "Waiting for live score…" forever.
+    async subscribe(cb){
+      await ensureReadAccess();
       onValue(ref(db, MATCH_PATH), (snap)=>{ cb(snap.val()); }, (err)=>{
         console.warn('LiveSync: subscribe failed:', err.message);
       });
@@ -486,6 +512,7 @@
     // already in progress (instead of overwriting it with a blank one).
     // Returns null if nothing is live yet, or on error.
     async pullOnce(){
+      await ensureReadAccess();
       try{
         const snap = await get(ref(db, MATCH_PATH));
         return snap.exists() ? snap.val() : null;
@@ -521,6 +548,23 @@
         console.warn('LiveSync: scorecard index write failed:', e.message);
       }
       return url;
+    },
+    // Lists every scorecard PDF that's been uploaded to Firebase (newest
+    // first), each with a direct download URL. Works for viewers too
+    // (anonymous read), not just the signed-in scorer.
+    async listScorecards(){
+      await ensureReadAccess();
+      try{
+        const snap = await get(ref(db, SCORECARDS_INDEX_PATH));
+        if(!snap.exists()) return [];
+        const val = snap.val();
+        return Object.keys(val)
+          .map(id=> Object.assign({id}, val[id]))
+          .sort((a,b)=> (b.savedAt||0) - (a.savedAt||0));
+      }catch(e){
+        console.warn('LiveSync: listScorecards failed:', e.message);
+        return [];
+      }
     }
   };
 </script>
@@ -852,7 +896,7 @@ function newInningsSkeleton(battingTeam,bowlingTeam,target){
   return {
     battingTeam, bowlingTeam,
     creaseA:null, creaseB:null, strikerEnd:'A',
-    batsStats:{}, bowlStats:{},
+    batsStats:{}, bowlStats:{}, fieldingStats:{},
     bowlerId:null, prevBowlerId:null,
     legalBallsThisOver:0, oversCompleted:0,
     totalRuns:0, totalWkts:0,
@@ -860,6 +904,10 @@ function newInningsSkeleton(battingTeam,bowlingTeam,target){
     thisOverEvents:[],
     target, done:false
   };
+}
+function ensureFielder(inn, id){
+  inn.fieldingStats = inn.fieldingStats || {}; // older saved/synced matches may predate this field
+  if(!inn.fieldingStats[id]) inn.fieldingStats[id] = {catches:0, runOuts:0, stumpings:0};
 }
 function ensureBatsman(inn, team, id){
   if(!inn.batsStats[id]) inn.batsStats[id] = {runs:0,balls:0,fours:0,sixes:0,out:false,outDesc:''};
@@ -964,7 +1012,7 @@ function recordByeLegBye(kind, runs){
   swapStrikeIfOdd(inn, runs);
   afterLegalBall();
 }
-function recordWicket(dismissal, outSide, runsCompleted){
+function recordWicket(dismissal, outSide, runsCompleted, fielderId, fieldingKind){
   snapshot();
   const inn = curInn();
   const sId = strikerId(inn);
@@ -977,11 +1025,18 @@ function recordWicket(dismissal, outSide, runsCompleted){
   }
   inn.batsStats[sId].balls += 1;
   inn.bowlStats[inn.bowlerId].balls += 1;
-  if(dismissal !== 'Run out') inn.bowlStats[inn.bowlerId].wkts += 1;
+  if(!dismissal.startsWith('Run out')) inn.bowlStats[inn.bowlerId].wkts += 1;
   inn.legalBallsThisOver += 1;
   inn.totalWkts += 1;
   inn.batsStats[outId].out = true;
   inn.batsStats[outId].outDesc = dismissal;
+  if(fielderId && fieldingKind){
+    inn.fieldingStats = inn.fieldingStats || {};
+    ensureFielder(inn, fielderId);
+    if(fieldingKind==='catch') inn.fieldingStats[fielderId].catches += 1;
+    else if(fieldingKind==='runout') inn.fieldingStats[fielderId].runOuts += 1;
+    else if(fieldingKind==='stumping') inn.fieldingStats[fielderId].stumpings += 1;
+  }
   addTickerEvent(inn,'W','wkt');
   swapStrikeIfOdd(inn, runsCompleted);
   // vacate the end
@@ -1080,6 +1135,109 @@ function computeResult(){
     M.resultText = team1+' won';
     M.resultSub = 'by '+margin+' run'+(margin===1?'':'s');
   }
+  computeAwards();
+}
+
+/* Works out Best Batsman, Best Bowler and Player of the Match from the
+   two innings' stats. Aggregates by (team+playerId) so it's safe even if
+   a player somehow appears more than once. Player of the Match uses a
+   simple fantasy-style impact score (runs + boundary/strike-rate bonus,
+   wickets*25 + economy bonus) — a reasonable stand-in for a full
+   fielding-aware model, since the app doesn't track catches/run-outs by
+   fielder. */
+function computeAwards(){
+  const battingPoints = {}, bowlingPoints = {}, fieldingPoints = {};
+  M.innings.forEach(inn=>{
+    Object.keys(inn.batsStats).forEach(id=>{
+      const s = inn.batsStats[id];
+      const key = inn.battingTeam+'_'+id;
+      if(!battingPoints[key]) battingPoints[key] = {name:playerName(inn.battingTeam,id), team:inn.battingTeam, runs:0, balls:0, fours:0, sixes:0};
+      battingPoints[key].runs += s.runs;
+      battingPoints[key].balls += s.balls;
+      battingPoints[key].fours += s.fours;
+      battingPoints[key].sixes += s.sixes;
+    });
+    Object.keys(inn.bowlStats).forEach(id=>{
+      const s = inn.bowlStats[id];
+      const key = inn.bowlingTeam+'_'+id;
+      if(!bowlingPoints[key]) bowlingPoints[key] = {name:playerName(inn.bowlingTeam,id), team:inn.bowlingTeam, wkts:0, runs:0, balls:0};
+      bowlingPoints[key].wkts += s.wkts;
+      bowlingPoints[key].runs += s.runs;
+      bowlingPoints[key].balls += s.balls;
+    });
+    // Fielding credit lives on the bowling side (they're the ones fielding).
+    Object.keys(inn.fieldingStats||{}).forEach(id=>{
+      const s = inn.fieldingStats[id];
+      const key = inn.bowlingTeam+'_'+id;
+      if(!fieldingPoints[key]) fieldingPoints[key] = {name:playerName(inn.bowlingTeam,id), team:inn.bowlingTeam, catches:0, runOuts:0, stumpings:0};
+      fieldingPoints[key].catches += s.catches||0;
+      fieldingPoints[key].runOuts += s.runOuts||0;
+      fieldingPoints[key].stumpings += s.stumpings||0;
+    });
+  });
+
+  let bestBatsman = null;
+  Object.values(battingPoints).forEach(p=>{
+    if(!bestBatsman || p.runs > bestBatsman.runs ||
+       (p.runs === bestBatsman.runs && p.balls>0 && bestBatsman.balls>0 && (p.runs/p.balls) > (bestBatsman.runs/bestBatsman.balls))){
+      bestBatsman = p;
+    }
+  });
+
+  let bestBowler = null;
+  Object.values(bowlingPoints).forEach(p=>{
+    const pEcon = p.balls>0 ? (p.runs/(p.balls/6)) : Infinity;
+    const bEcon = bestBowler && bestBowler.balls>0 ? (bestBowler.runs/(bestBowler.balls/6)) : Infinity;
+    if(!bestBowler || p.wkts > bestBowler.wkts || (p.wkts === bestBowler.wkts && pEcon < bEcon)){
+      bestBowler = p;
+    }
+  });
+
+  // Best Fielder — only surfaced if someone actually took a catch/run out/
+  // stumping (most casual matches won't have this tracked for every ball,
+  // so an empty fielding record shouldn't produce a misleading "winner").
+  let bestFielder = null, bestFielderScore = 0;
+  Object.values(fieldingPoints).forEach(p=>{
+    const score = p.catches*3 + p.runOuts*3 + p.stumpings*2;
+    if(score > bestFielderScore){ bestFielderScore = score; bestFielder = p; }
+  });
+
+  const allKeys = new Set([...Object.keys(battingPoints), ...Object.keys(bowlingPoints), ...Object.keys(fieldingPoints)]);
+  let potm = null, potmScore = -Infinity;
+  allKeys.forEach(key=>{
+    const bat = battingPoints[key], bowl = bowlingPoints[key], field = fieldingPoints[key];
+    let score = 0;
+    const name = bat ? bat.name : (bowl ? bowl.name : field.name);
+    const team = bat ? bat.team : (bowl ? bowl.team : field.team);
+    if(bat){
+      score += bat.runs + bat.fours*1 + bat.sixes*2;
+      if(bat.balls >= 10){
+        const sr = bat.runs/bat.balls*100;
+        score += sr>130 ? 10 : sr>100 ? 5 : 0;
+      }
+    }
+    if(bowl){
+      score += bowl.wkts*25;
+      if(bowl.balls >= 12){
+        const econ = bowl.runs/(bowl.balls/6);
+        score += econ<6 ? 10 : econ<8 ? 5 : 0;
+      }
+    }
+    if(field){
+      // Catches/run-outs are match-turning moments in their own right —
+      // weighted close to a "part-wicket" so a great fielding display can
+      // genuinely swing Player of the Match, not just nudge it.
+      score += field.catches*8 + field.runOuts*8 + field.stumpings*6;
+    }
+    if(score > potmScore){ potmScore = score; potm = {name, team}; }
+  });
+
+  M.awards = {
+    bestBatsman: bestBatsman ? {name:bestBatsman.name, team:bestBatsman.team, runs:bestBatsman.runs, balls:bestBatsman.balls, fours:bestBatsman.fours, sixes:bestBatsman.sixes} : null,
+    bestBowler: bestBowler ? {name:bestBowler.name, team:bestBowler.team, wkts:bestBowler.wkts, runs:bestBowler.runs, balls:bestBowler.balls} : null,
+    bestFielder: bestFielder ? {name:bestFielder.name, team:bestFielder.team, catches:bestFielder.catches, runOuts:bestFielder.runOuts, stumpings:bestFielder.stumpings} : null,
+    potm: potm
+  };
 }
 
 function startSecondInnings(){
@@ -1154,9 +1312,39 @@ function buildScorecardHTML(){
 
   if(M.stage==='finished'){
     html += `<div class="pr-result">${M.resultText}</div><div class="pr-result-sub">${M.resultSub}</div>`;
+    html += buildAwardsHTML();
   }
   html += `<div class="pr-footer">Generated by RKCricScore</div>`;
   return html;
+}
+
+/* Small HTML block for Player of the Match / Best Batsman / Best Bowler,
+   shared by the on-screen scorecard modal, the PDF preview, and the
+   exported/standalone file (all three render buildScorecardHTML()). */
+/* Shared formatter for the Best Fielder line (used in the PDF, the
+   in-app cards, and the viewer). Returns '' if there's nothing to show —
+   callers should skip the row entirely rather than print a blank one. */
+function formatFielderAward(f, teamNames){
+  if(!f) return '';
+  const parts = [];
+  if(f.catches) parts.push(f.catches+' catch'+(f.catches===1?'':'es'));
+  if(f.runOuts) parts.push(f.runOuts+' run out'+(f.runOuts===1?'':'s'));
+  if(f.stumpings) parts.push(f.stumpings+' stumping'+(f.stumpings===1?'':'s'));
+  if(parts.length===0) return '';
+  return `${f.name} (${teamNames[f.team]}) — ${parts.join(', ')}`;
+}
+
+function buildAwardsHTML(){
+  if(!M.awards) return '';
+  const a = M.awards;
+  const row = (label, val)=> `<div class="pr-award-row"><span class="pr-award-label">${label}</span><span class="pr-award-val">${val}</span></div>`;
+  let rows = '';
+  rows += row('🏆 Player of the Match', a.potm ? `${a.potm.name} (${M.teamNames[a.potm.team]})` : '—');
+  rows += row('🏏 Best Batsman', a.bestBatsman ? `${a.bestBatsman.name} (${M.teamNames[a.bestBatsman.team]}) — ${a.bestBatsman.runs} (${a.bestBatsman.balls}b, ${a.bestBatsman.fours}x4 ${a.bestBatsman.sixes}x6)` : '—');
+  rows += row('🎯 Best Bowler', a.bestBowler ? `${a.bestBowler.name} (${M.teamNames[a.bestBowler.team]}) — ${a.bestBowler.wkts}/${a.bestBowler.runs} (${Math.floor(a.bestBowler.balls/6)}.${a.bestBowler.balls%6} ov)` : '—');
+  const fielderLine = formatFielderAward(a.bestFielder, M.teamNames);
+  if(fielderLine) rows += row('🧤 Best Fielder', fielderLine);
+  return `<div class="pr-awards"><h3 class="pr-section">Awards</h3>${rows}</div>`;
 }
 
 /* Build a complete standalone HTML file (for saving/sharing) */
@@ -1183,6 +1371,11 @@ function buildStandaloneFile(){
     .pr-result{font-size:18px;font-weight:700;color:#1a5c1a!important;margin:14px 0 4px;}
     .pr-result-sub{font-size:13px;color:#444!important;margin:0 0 14px;}
     .pr-footer{font-size:9px;color:#999!important;border-top:1px solid #eee;padding:8px 0;margin-top:8px;}
+    .pr-awards{margin:2px 0 12px;}
+    .pr-award-row{display:flex;justify-content:space-between;align-items:baseline;gap:10px;padding:5px 0;border-bottom:1px solid #eee;}
+    .pr-award-row:last-child{border-bottom:none;}
+    .pr-award-label{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#666!important;white-space:nowrap;}
+    .pr-award-val{font-size:12px;font-weight:700;color:#111!important;text-align:right;}
     @media print{*{-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important;}}
   `;
   return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RKCricScore Scorecard</title><style>${css}</style></head><body>${buildScorecardHTML()}</body></html>`;
@@ -1257,7 +1450,8 @@ async function autoPushFinishedScorecardToFirebase(){
     if(!blob) return;
     await window.LiveSync.uploadScorecard(blob, baseName, {
       teamA: M.teamNames.A, teamB: M.teamNames.B,
-      resultText: M.resultText||'', resultSub: M.resultSub||''
+      resultText: M.resultText||'', resultSub: M.resultSub||'',
+      potm: M.awards && M.awards.potm ? `${M.awards.potm.name} (${M.teamNames[M.awards.potm.team]})` : ''
     });
   }catch(e){
     console.warn('Auto scorecard upload to Firebase failed:', e.message);
@@ -1402,7 +1596,8 @@ function exportPDF(){
         if(!blob) throw new Error('Could not generate the PDF (no internet? html2pdf failed to load)');
         await window.LiveSync.uploadScorecard(blob, baseName, {
           teamA: M.teamNames.A, teamB: M.teamNames.B,
-          resultText: M.resultText||'', resultSub: M.resultSub||''
+          resultText: M.resultText||'', resultSub: M.resultSub||'',
+          potm: M.awards && M.awards.potm ? `${M.awards.potm.name} (${M.teamNames[M.awards.potm.team]})` : ''
         });
         fbBtn.textContent = '✅ Saved to Firebase';
       }catch(e){
@@ -1466,17 +1661,62 @@ function render(){
    existing .scoreboard / .sb-* CSS classes already defined at the top
    of the file, so it visually matches the rest of the app. */
 let liveViewerSubscribed = false;
+let viewerShowScorecards = false;   // toggles viewer between live score and past-PDFs list
+let viewerScorecards = null;        // cached list once fetched
+let viewerScorecardsLoading = false;
 function renderViewerMode(){
   const app = document.getElementById('app');
   app.innerHTML = '';
   const bar = el(`<div class="topbar">
     <div class="brand"><div class="dot"></div><div><span>RKCricScore</span><small>Live</small></div></div>
+    <div style="display:flex; gap:8px;"></div>
   </div>`);
   app.appendChild(bar);
+  const btnWrap = bar.querySelector('div[style]');
+  const toggleBtn = document.createElement('button'); toggleBtn.className='iconbtn';
+  toggleBtn.textContent = viewerShowScorecards ? '🏏 Live score' : '📁 Scorecards';
+  toggleBtn.onclick = ()=>{
+    viewerShowScorecards = !viewerShowScorecards;
+    if(viewerShowScorecards && !viewerScorecards && window.LiveSync){
+      viewerScorecardsLoading = true;
+      window.LiveSync.listScorecards().then(items=>{
+        viewerScorecards = items; viewerScorecardsLoading = false; renderViewerMode();
+      });
+    }
+    renderViewerMode();
+  };
+  btnWrap.appendChild(toggleBtn);
 
   if(!liveViewerSubscribed && window.LiveSync){
     liveViewerSubscribed = true;
-    window.LiveSync.subscribe((state)=>{ liveViewState = state; renderViewerMode(); });
+    window.LiveSync.subscribe((state)=>{ liveViewState = state; if(!viewerShowScorecards) renderViewerMode(); });
+  }
+
+  if(viewerShowScorecards){
+    const wrap = el('<div class="wrap"></div>');
+    wrap.appendChild(el('<h2 style="font-size:19px; margin-bottom:10px;">Saved scorecards</h2>'));
+    if(viewerScorecardsLoading){
+      wrap.appendChild(el('<p class="hint">Loading…</p>'));
+    } else if(!viewerScorecards || viewerScorecards.length===0){
+      wrap.appendChild(el('<p class="hint">No scorecards uploaded yet.</p>'));
+    } else {
+      viewerScorecards.forEach(item=>{
+        const when = item.savedAt ? new Date(item.savedAt).toLocaleString('en-GB',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
+        const teamLine = (item.teamA||'Team A')+' vs '+(item.teamB||'Team B');
+        const row = el(`<div class="card" style="padding:12px 14px; margin-bottom:10px;">
+          <div style="font-weight:600;">${teamLine}</div>
+          ${item.resultText ? `<div class="hint" style="margin:2px 0 0;">${item.resultText}</div>` : ''}
+          ${item.potm ? `<div class="hint" style="margin:2px 0 0;">🏆 ${item.potm}</div>` : ''}
+          <div class="hint" style="margin-top:4px;">${when}</div>
+        </div>`);
+        const dl = el('<a class="btn-ghost" style="display:block; text-align:center; text-decoration:none; margin-top:8px;">⬇️ Open / Download PDF</a>');
+        dl.href = item.url; dl.target = '_blank'; dl.rel = 'noopener';
+        row.appendChild(dl);
+        wrap.appendChild(row);
+      });
+    }
+    app.appendChild(wrap);
+    return;
   }
 
   if(!liveViewState){
@@ -1503,6 +1743,19 @@ function renderViewerMode(){
   app.appendChild(sb);
   if(vm.resultText){
     app.appendChild(el(`<div class="wrap"><div class="card"><b>${vm.resultText}</b><div class="hint">${vm.resultSub||''}</div></div></div>`));
+    if(vm.awards){
+      const a = vm.awards;
+      const wrap = el('<div class="wrap" style="padding-top:0;"></div>');
+      const card = el('<div class="awards-block"></div>');
+      const row = (label, val)=> el(`<div class="award-row"><span class="award-label">${label}</span><span class="award-val">${val}</span></div>`);
+      card.appendChild(row('🏆 Player of the Match', a.potm ? `${a.potm.name} (${vm.teamNames[a.potm.team]})` : '—'));
+      card.appendChild(row('🏏 Best Batsman', a.bestBatsman ? `${a.bestBatsman.name} (${vm.teamNames[a.bestBatsman.team]}) — ${a.bestBatsman.runs} (${a.bestBatsman.balls}b)` : '—'));
+      card.appendChild(row('🎯 Best Bowler', a.bestBowler ? `${a.bestBowler.name} (${vm.teamNames[a.bestBowler.team]}) — ${a.bestBowler.wkts}/${a.bestBowler.runs}` : '—'));
+      const fielderLine = formatFielderAward(a.bestFielder, vm.teamNames);
+      if(fielderLine) card.appendChild(row('🧤 Best Fielder', fielderLine));
+      wrap.appendChild(card);
+      app.appendChild(wrap);
+    }
   }
 }
 
@@ -1535,6 +1788,10 @@ function renderTopbar(){
   gh.textContent = githubCanWrite() ? '☁️ Synced' : '☁️ Sync';
   gh.onclick=()=>{modal={type:'githubSync'}; render();};
   btnWrap.appendChild(gh);
+
+  const pdfs = document.createElement('button'); pdfs.className='iconbtn'; pdfs.textContent='📁 PDFs';
+  pdfs.onclick=()=>{modal={type:'firebaseScorecards', loading:true, items:[]}; render(); loadFirebaseScorecardsIntoModal();};
+  btnWrap.appendChild(pdfs);
 
   const live = document.createElement('button'); live.className='iconbtn';
   const signedIn = window.LiveSync && window.LiveSync.isSignedIn();
@@ -1571,6 +1828,22 @@ function renderTopbar(){
   };
   btnWrap.appendChild(live);
   return bar;
+}
+
+/* Fetches the list of uploaded scorecard PDFs from Firebase in the
+   background and refreshes the modal once they arrive. Safe to call
+   even if the modal gets closed/changed before the fetch finishes. */
+async function loadFirebaseScorecardsIntoModal(){
+  if(!window.LiveSync){ 
+    if(modal && modal.type==='firebaseScorecards'){ modal.loading=false; modal.error='Live sync is still loading — try again in a second.'; render(); }
+    return;
+  }
+  const items = await window.LiveSync.listScorecards();
+  if(modal && modal.type==='firebaseScorecards'){
+    modal.loading = false;
+    modal.items = items;
+    render();
+  }
 }
 
 function renderPlayerManagerScreen(){
@@ -2028,9 +2301,27 @@ function renderBetweenScreen(){
   return wrap;
 }
 
+/* DOM version of the awards block (Potm/Best Bat/Best Bowl), for the
+   in-app finished screen and full-scorecard modal. Returns null if no
+   awards computed yet (e.g. mid-match). */
+function renderAwardsCard(){
+  if(!M.awards) return null;
+  const a = M.awards;
+  const card = el('<div class="awards-block"></div>');
+  const row = (label, val)=> el(`<div class="award-row"><span class="award-label">${label}</span><span class="award-val">${val}</span></div>`);
+  card.appendChild(row('🏆 Player of the Match', a.potm ? `${a.potm.name} (${M.teamNames[a.potm.team]})` : '—'));
+  card.appendChild(row('🏏 Best Batsman', a.bestBatsman ? `${a.bestBatsman.name} (${M.teamNames[a.bestBatsman.team]}) — ${a.bestBatsman.runs} (${a.bestBatsman.balls}b, ${a.bestBatsman.fours}x4 ${a.bestBatsman.sixes}x6)` : '—'));
+  card.appendChild(row('🎯 Best Bowler', a.bestBowler ? `${a.bestBowler.name} (${M.teamNames[a.bestBowler.team]}) — ${a.bestBowler.wkts}/${a.bestBowler.runs} (${Math.floor(a.bestBowler.balls/6)}.${a.bestBowler.balls%6} ov)` : '—'));
+  const fielderLine = formatFielderAward(a.bestFielder, M.teamNames);
+  if(fielderLine) card.appendChild(row('🧤 Best Fielder', fielderLine));
+  return card;
+}
+
 function renderFinishedScreen(){
   const frag = document.createElement('div');
   frag.appendChild(el(`<div class="result-banner"><h2>${M.resultText}</h2><p>${M.resultSub}</p></div>`));
+  const awards = renderAwardsCard();
+  if(awards) frag.appendChild(awards);
   const btnWrap = el('<div class="wrap" style="padding-top:0;"></div>');
   const sc = el('<button class="btn-ghost" style="margin-top:0;">View full scorecard</button>');
   sc.onclick = ()=>{ modal={type:'scorecard'}; render(); };
@@ -2089,6 +2380,7 @@ function renderModal(){
       b.onclick = ()=>{
         if(t==='Run out'){ modal={type:'runOutDetail'}; render(); }
         else if(t==='Caught'){ modal={type:'caughtBy'}; render(); }
+        else if(t==='Stumped'){ modal={type:'stumpedBy'}; render(); }
         else { recordWicket(t,'striker',0); }
       };
       m.appendChild(b);
@@ -2111,10 +2403,34 @@ function renderModal(){
         const dismissal = isBowler
           ? `c & b ${name}`
           : `c ${name} b ${bwName}`;
-        recordWicket(dismissal,'striker',0);
+        recordWicket(dismissal,'striker',0, id, 'catch');
       };
       m.appendChild(b);
     });
+    const back = el('<button class="modal-close">← Back</button>');
+    back.onclick = ()=>{ modal={type:'wicketType'}; render(); };
+    m.appendChild(back);
+  }
+  else if(modal.type==='stumpedBy'){
+    const inn = curInn();
+    m.appendChild(el('<h3>Stumped — who took it?</h3>'));
+    m.appendChild(el('<p class="hint" style="margin-bottom:12px;">Select the wicketkeeper (or fielder) from the bowling side.</p>'));
+    teamSquad(inn.bowlingTeam).forEach((name,idx)=>{
+      const id = inn.bowlingTeam+'_'+idx;
+      if(id === inn.bowlerId) return; // the keeper can't also be the bowler
+      const b = el(`<button class="list-btn">${name}</button>`);
+      b.onclick = ()=>{
+        const bwName = playerName(inn.bowlingTeam, inn.bowlerId);
+        recordWicket(`st ${name} b ${bwName}`, 'striker', 0, id, 'stumping');
+      };
+      m.appendChild(b);
+    });
+    const skip = el('<button class="btn-ghost" style="margin-top:6px;">Skip — don\'t credit a keeper</button>');
+    skip.onclick = ()=>{
+      const bwName = playerName(inn.bowlingTeam, inn.bowlerId);
+      recordWicket(`Stumped b ${bwName}`, 'striker', 0);
+    };
+    m.appendChild(skip);
     const back = el('<button class="modal-close">← Back</button>');
     back.onclick = ()=>{ modal={type:'wicketType'}; render(); };
     m.appendChild(back);
@@ -2148,12 +2464,29 @@ function renderModal(){
     m.appendChild(el('<label>Who was out?</label>'));
     const sBtn = el(`<button class="list-btn">${playerName(inn.battingTeam, strikerId(inn))} (striker)</button>`);
     const nBtn = el(`<button class="list-btn">${playerName(inn.battingTeam, nonStrikerId(inn))} (non-striker)</button>`);
-    sBtn.onclick = ()=> recordWicket('Run out','striker',chosenRuns);
-    nBtn.onclick = ()=> recordWicket('Run out','nonStriker',chosenRuns);
+    sBtn.onclick = ()=>{ modal={type:'runOutFielder', runsCompleted:chosenRuns, outSide:'striker'}; render(); };
+    nBtn.onclick = ()=>{ modal={type:'runOutFielder', runsCompleted:chosenRuns, outSide:'nonStriker'}; render(); };
     m.appendChild(sBtn); m.appendChild(nBtn);
     const close = el('<button class="modal-close">Cancel</button>');
     close.onclick = ()=>{ modal=null; render(); };
     m.appendChild(close);
+  }
+  else if(modal.type==='runOutFielder'){
+    const inn = curInn();
+    m.appendChild(el('<h3>Run out — credit the fielder</h3>'));
+    m.appendChild(el('<p class="hint" style="margin-bottom:12px;">Who threw/hit the stumps? (Optional, but counts towards Player of the Match.)</p>'));
+    teamSquad(inn.bowlingTeam).forEach((name,idx)=>{
+      const id = inn.bowlingTeam+'_'+idx;
+      const b = el(`<button class="list-btn">${name}</button>`);
+      b.onclick = ()=> recordWicket(`Run out (${name})`, modal.outSide, modal.runsCompleted, id, 'runout');
+      m.appendChild(b);
+    });
+    const skip = el('<button class="btn-ghost" style="margin-top:6px;">Skip — don\'t credit a fielder</button>');
+    skip.onclick = ()=> recordWicket('Run out', modal.outSide, modal.runsCompleted);
+    m.appendChild(skip);
+    const back = el('<button class="modal-close">← Back</button>');
+    back.onclick = ()=>{ modal={type:'runOutDetail'}; render(); };
+    m.appendChild(back);
   }
   else if(modal.type==='newBatsman'){
     const inn = curInn();
@@ -2333,12 +2666,52 @@ function renderModal(){
       m.appendChild(el(`<div class="sectitle" style="margin:14px 0 6px;">Bowling — ${M.teamNames[inn.bowlingTeam]}</div>`));
       m.appendChild(renderBowlingTable(inn));
     });
+    const awards = renderAwardsCard();
+    if(awards){
+      m.appendChild(el('<div class="sectitle" style="margin:14px 0 6px;">Awards</div>'));
+      m.appendChild(awards);
+    }
     const close = el('<button class="modal-close">Close</button>');
     close.onclick = ()=>{ modal=null; render(); };
     m.appendChild(close);
     const pdfBtn = el('<button class="btn-pdf" style="margin-top:10px;">📄 Export as PDF</button>');
     pdfBtn.onclick = exportPDF;
     m.appendChild(pdfBtn);
+  }
+  else if(modal.type==='firebaseScorecards'){
+    m.appendChild(el('<h3>📁 Scorecards saved to Firebase</h3>'));
+    m.appendChild(el(`<p class="hint" style="margin-bottom:14px;">
+      Every match scorecard that's been uploaded to Firebase (automatically when a match finishes, or via
+      "Save scorecard to Firebase"). Tap a match to open/download its PDF.
+    </p>`));
+    if(modal.loading){
+      m.appendChild(el('<p class="hint">Loading…</p>'));
+    } else if(modal.error){
+      m.appendChild(el(`<p class="hint" style="color:var(--red);">${modal.error}</p>`));
+    } else if(!modal.items || modal.items.length===0){
+      m.appendChild(el('<p class="hint">No scorecards uploaded yet.</p>'));
+    } else {
+      modal.items.forEach(item=>{
+        const when = item.savedAt ? new Date(item.savedAt).toLocaleString('en-GB',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
+        const teamLine = (item.teamA||'Team A')+' vs '+(item.teamB||'Team B');
+        const row = el(`<div class="card" style="padding:12px 14px; margin-bottom:10px;">
+          <div style="font-weight:600;">${teamLine}</div>
+          ${item.resultText ? `<div class="hint" style="margin:2px 0 0;">${item.resultText}</div>` : ''}
+          ${item.potm ? `<div class="hint" style="margin:2px 0 0;">🏆 ${item.potm}</div>` : ''}
+          <div class="hint" style="margin-top:4px;">${when}</div>
+        </div>`);
+        const dl = el('<a class="btn-ghost" style="display:block; text-align:center; text-decoration:none; margin-top:8px;">⬇️ Open / Download PDF</a>');
+        dl.href = item.url; dl.target = '_blank'; dl.rel = 'noopener';
+        row.appendChild(dl);
+        m.appendChild(row);
+      });
+    }
+    const refresh = el('<button class="btn-ghost" style="margin-top:4px;">🔄 Refresh</button>');
+    refresh.onclick = ()=>{ modal.loading=true; modal.error=null; render(); loadFirebaseScorecardsIntoModal(); };
+    m.appendChild(refresh);
+    const close = el('<button class="modal-close" style="margin-top:8px;">Close</button>');
+    close.onclick = ()=>{ modal=null; render(); };
+    m.appendChild(close);
   }
   return overlay;
 }
