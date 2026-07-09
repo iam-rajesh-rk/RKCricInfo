@@ -964,7 +964,6 @@ function startMatchFromForm(){
   // save squads for next time
   if(document.getElementById('saveSquadChk') && document.getElementById('saveSquadChk').checked){
     saveSquads({A:an,B:bn},{A:ap,B:bp});
-    pushSquadsToGithub();
     if(window.LiveSync) window.LiveSync.pushSquads({teamNames:{A:an,B:bn}, squads:{A:ap,B:bp}});
   }
   M.stage = 'toss';
@@ -2076,7 +2075,7 @@ function renderSetupScreen(){
     <p class="hint" style="margin-top:8px;">
       ${(window.LiveSync && window.LiveSync.isSignedIn())
         ? '🟢 Signed in — saving will also sync these squads live for anyone opening this page\'s link.'
-        : '🔒 Turn on Live (top bar, with the PIN) before saving to also sync these squads for everyone else opening the link — otherwise they\'re only remembered on this device (and GitHub, if set up).'}
+        : '🔒 Turn on Live (top bar, with the PIN) before saving to also sync these squads for everyone else opening the link — otherwise they\'re only remembered on this device.'}
     </p>
     <button class="btn-ghost" id="saveSquadNowBtn" style="margin-top:8px;">☁️ Save squad now (no need to start the match)</button>
 
@@ -2093,7 +2092,6 @@ function renderSetupScreen(){
     const ap = parsePlayers(wrap.querySelector('#teamAPlayers').value);
     const bp = parsePlayers(wrap.querySelector('#teamBPlayers').value);
     saveSquads({A:an,B:bn},{A:ap,B:bp});
-    pushSquadsToGithub();
     if(window.LiveSync && window.LiveSync.isSignedIn()){
       btn.disabled = true; btn.textContent = '⏳ Saving…';
       try{
