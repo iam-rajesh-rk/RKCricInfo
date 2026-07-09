@@ -492,6 +492,11 @@
   // page link sees the latest squads, and anyone who's entered the PIN
   // can update them — no GitHub token required for this part.
   const SQUADS_PATH = 'squads_current';
+  // Saved-squads *library* (the named, reusable squads under "Manage
+  // Players") — separate from SQUADS_PATH above, which is just the
+  // current match's two teams. Syncing this too means a squad saved on
+  // one device (once Live+PIN is on) shows up on every other device.
+  const LIBRARY_PATH = 'player_library_current';
 
   // Scorer "account" that Database/Storage Rules check auth.uid against.
   // Sign-in only ever needs the PIN (the password) — nobody types this
@@ -503,6 +508,7 @@
 
   let writeTimer = null;
   let squadsWriteTimer = null;
+  let libraryWriteTimer = null;
 
   // Makes sure *some* auth session exists before a read, so Database Rules
   // requiring `auth != null` don't block viewers who never enter the PIN.
@@ -561,6 +567,31 @@
         return snap.exists() ? snap.val() : null;
       }catch(e){
         console.warn('LiveSync: squads pull failed:', e.message);
+        return null;
+      }
+    },
+    // Pushes the saved-squads *library* (all the named squads under
+    // "Manage Players") so it's shared across every device once this one
+    // is Live-signed-in with the PIN. Same debounced, best-effort,
+    // silent-on-failure pattern as pushSquads() above.
+    pushLibrary(libraryPayload){
+      clearTimeout(libraryWriteTimer);
+      libraryWriteTimer = setTimeout(()=>{
+        set(ref(db, LIBRARY_PATH), libraryPayload).catch(e=>{
+          console.warn('LiveSync: library push failed (probably not signed in):', e.message);
+        });
+      }, 400);
+    },
+    // One-off read of the shared player library — called on page load and
+    // whenever the Manage Players screen opens, so squads saved on another
+    // device show up here too. Returns null if nothing's been shared yet.
+    async pullLibraryOnce(){
+      await ensureReadAccess();
+      try{
+        const snap = await get(ref(db, LIBRARY_PATH));
+        return snap.exists() ? snap.val() : null;
+      }catch(e){
+        console.warn('LiveSync: library pull failed:', e.message);
         return null;
       }
     },
@@ -1953,7 +1984,10 @@ function renderPlayerManagerScreen(){
   const frag = document.createElement('div');
   const wrap = el('<div class="wrap"></div>');
   wrap.appendChild(el('<h2 style="font-size:21px; margin-bottom:2px;">Manage Players</h2>'));
-  wrap.appendChild(el('<p class="hint" style="margin-bottom:14px;">Save squads once, then load them instantly when setting up a match.</p>'));
+  wrap.appendChild(el('<p class="hint" style="margin-bottom:6px;">Save squads once, then load them instantly when setting up a match.</p>'));
+  wrap.appendChild(el(window.LiveSync && window.LiveSync.isSignedIn()
+    ? '<p class="hint" style="margin-bottom:14px; color:var(--lime); font-weight:600;">🟢 Signed in — squads saved here sync to every device.</p>'
+    : '<p class="hint" style="margin-bottom:14px;">🔒 Turn on Live (top bar, with the PIN) so squads saved here sync to every device — otherwise they only stay on this device.</p>'));
 
   if(playerManagerEdit){
     wrap.appendChild(renderSquadEditor(playerManagerEdit));
@@ -1975,8 +2009,10 @@ function renderPlayerManagerScreen(){
       const delBtn = el('<button class="iconbtn" style="color:var(--red); border-color:var(--red);">Delete</button>');
       delBtn.onclick = ()=>{
         if(confirm('Delete "'+sq.name+'"? This cannot be undone.')){
-          savePlayerLibrary(loadPlayerLibrary().filter(s=>s.id!==sq.id));
+          const list = loadPlayerLibrary().filter(s=>s.id!==sq.id);
+          savePlayerLibrary(list);
           pushLibraryToGithub();
+          if(window.LiveSync) window.LiveSync.pushLibrary(list);
           render();
         }
       };
@@ -2021,6 +2057,7 @@ function renderSquadEditor(edit){
     }
     savePlayerLibrary(list);
     pushLibraryToGithub();
+    if(window.LiveSync) window.LiveSync.pushLibrary(list);
     playerManagerEdit = null;
     render();
   };
@@ -2082,7 +2119,17 @@ function renderSetupScreen(){
     <button class="btn-primary" id="startBtn" style="margin-top:18px;">Continue to toss ›</button>
   </div>`);
 
-  wrap.querySelector('#manageplayersBtn').onclick = ()=>{ showPlayerManager=true; playerManagerEdit=null; render(); };
+  wrap.querySelector('#manageplayersBtn').onclick = ()=>{
+    showPlayerManager=true; playerManagerEdit=null; render();
+    // Refresh from Firebase every time this screen opens, so a squad
+    // saved on another device (while this one was on a different screen)
+    // shows up without needing a full page reload.
+    if(window.LiveSync){
+      window.LiveSync.pullLibraryOnce().then(remote=>{
+        if(Array.isArray(remote)){ savePlayerLibrary(remote); if(showPlayerManager) render(); }
+      });
+    }
+  };
 
   wrap.querySelector('#saveSquadNowBtn').onclick = async ()=>{
     const btn = wrap.querySelector('#saveSquadNowBtn');
@@ -2937,6 +2984,23 @@ function tryPullFirebaseSquads(retriesLeft){
   }
 }
 tryPullFirebaseSquads(25); // ~5s of retrying while the Firebase SDK modules load
+
+/* Same idea, but for the "Manage Players" saved-squads library: pull the
+   shared library once on load so squads saved on another device (with
+   Live+PIN) show up here too, without needing GitHub Sync configured. */
+function tryPullFirebaseLibrary(retriesLeft){
+  if(window.LiveSync){
+    window.LiveSync.pullLibraryOnce().then(remote=>{
+      if(Array.isArray(remote)){
+        savePlayerLibrary(remote);
+        if(showPlayerManager) render();
+      }
+    });
+  } else if(retriesLeft > 0){
+    setTimeout(()=>tryPullFirebaseLibrary(retriesLeft-1), 200);
+  }
+}
+tryPullFirebaseLibrary(25);
 </script>
 </body>
 </html>
