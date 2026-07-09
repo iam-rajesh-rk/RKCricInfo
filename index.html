@@ -535,6 +535,14 @@
         });
       }, 400);
     },
+    // Same write as pushSquads, but immediate (no debounce) and it
+    // actually rejects on failure — used by an explicit "Save now" button
+    // that needs to show real success/failure feedback, rather than the
+    // silent best-effort auto-sync that happens when starting a match.
+    async pushSquadsNow(squadsPayload){
+      if(!auth.currentUser) throw new Error('Turn on Live (with the PIN) first, so this device is signed in.');
+      await set(ref(db, SQUADS_PATH), squadsPayload);
+    },
     // Live subscription to squad changes — works for anonymous readers
     // too (like subscribe() for the match), so everyone with the link
     // sees the latest squads without needing to sign in.
@@ -2070,11 +2078,36 @@ function renderSetupScreen(){
         ? '🟢 Signed in — saving will also sync these squads live for anyone opening this page\'s link.'
         : '🔒 Turn on Live (top bar, with the PIN) before saving to also sync these squads for everyone else opening the link — otherwise they\'re only remembered on this device (and GitHub, if set up).'}
     </p>
+    <button class="btn-ghost" id="saveSquadNowBtn" style="margin-top:8px;">☁️ Save squad now (no need to start the match)</button>
 
     <button class="btn-primary" id="startBtn" style="margin-top:18px;">Continue to toss ›</button>
   </div>`);
 
   wrap.querySelector('#manageplayersBtn').onclick = ()=>{ showPlayerManager=true; playerManagerEdit=null; render(); };
+
+  wrap.querySelector('#saveSquadNowBtn').onclick = async ()=>{
+    const btn = wrap.querySelector('#saveSquadNowBtn');
+    const original = btn.textContent;
+    const an = wrap.querySelector('#teamAName').value.trim() || 'Team A';
+    const bn = wrap.querySelector('#teamBName').value.trim() || 'Team B';
+    const ap = parsePlayers(wrap.querySelector('#teamAPlayers').value);
+    const bp = parsePlayers(wrap.querySelector('#teamBPlayers').value);
+    saveSquads({A:an,B:bn},{A:ap,B:bp});
+    pushSquadsToGithub();
+    if(window.LiveSync && window.LiveSync.isSignedIn()){
+      btn.disabled = true; btn.textContent = '⏳ Saving…';
+      try{
+        await window.LiveSync.pushSquadsNow({teamNames:{A:an,B:bn}, squads:{A:ap,B:bp}});
+        btn.textContent = '✅ Saved — synced for everyone with the link';
+      }catch(e){
+        btn.textContent = '❌ '+e.message;
+      }
+      btn.disabled = false;
+    } else {
+      btn.textContent = '💾 Saved on this device (turn on Live to sync for everyone)';
+    }
+    setTimeout(()=>{ btn.textContent = original; }, 3000);
+  };
 
   if(saved) wrap.querySelector('#clearSquadBtn').onclick = ()=>{ clearSavedSquads(); render(); };
 
