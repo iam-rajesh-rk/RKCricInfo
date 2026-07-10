@@ -675,14 +675,18 @@
     // Requires the device to be signed in (Live must be turned on).
     // `meta` is a small plain object (team names, result text, etc.) —
     // passed in by the caller since this module can't see the app's `M`.
-    async uploadScorecard(blob, baseName, meta){
+    // Pass `existingId` to overwrite a previously-saved entry for this
+    // same match instead of creating a brand-new (duplicate) one — e.g.
+    // when the auto-save-on-finish already ran and the scorer then also
+    // taps the manual "Save scorecard to Firebase" button.
+    async uploadScorecard(blob, baseName, meta, existingId){
       await authReady;
       if(!auth.currentUser) throw new Error('Turn on Live (with the PIN) first, so this device is signed in.');
       const pdfBase64 = await blobToBase64(blob);
-      const newRef = push(ref(db, SCORECARDS_INDEX_PATH));
-      const id = newRef.key;
+      const idRef = existingId ? ref(db, SCORECARDS_INDEX_PATH+'/'+existingId) : push(ref(db, SCORECARDS_INDEX_PATH));
+      const id = existingId || idRef.key;
       await set(ref(db, SCORECARDS_FILES_PATH+'/'+id), { pdfBase64 });
-      await set(newRef, Object.assign({}, meta||{}, { baseName, savedAt: Date.now() }));
+      await set(idRef, Object.assign({}, meta||{}, { baseName, savedAt: Date.now() }));
       return id;
     },
     // Lists every scorecard that's been saved (newest first) — metadata
@@ -1615,9 +1619,12 @@ function deliverFile(blob, fname, mime){
    (i.e. the scorer opted into live sync). Builds the scorecard off-screen
    so it doesn't require the export overlay to be open. Never throws —
    if it fails (offline, not signed in, etc.) the scorer can still use the
-   manual "Save scorecard to Firebase" button from the Scorecard screen. */
+   manual "Save scorecard to Firebase" button from the Scorecard screen.
+   Guarded by M.firebaseScorecardId so this never creates a second,
+   duplicate entry for the same match (e.g. if the scorer also taps the
+   manual save button afterwards — that reuses this same id instead). */
 async function autoPushFinishedScorecardToFirebase(){
-  if(VIEW_MODE || !(window.LiveSync && window.LiveSync.isSignedIn())) return;
+  if(VIEW_MODE || M.firebaseScorecardId || !(window.LiveSync && window.LiveSync.isSignedIn())) return;
   const holder = document.createElement('div');
   holder.className = 'rk-pdf-source';
   holder.style.cssText = 'position:fixed; left:-9999px; top:0; width:800px;';
@@ -1627,11 +1634,13 @@ async function autoPushFinishedScorecardToFirebase(){
     const baseName = scorecardFilename().replace(/\.html$/,'');
     const blob = await renderScorecardToPDFBlob(holder, baseName);
     if(!blob) return;
-    await window.LiveSync.uploadScorecard(blob, baseName, {
+    const id = await window.LiveSync.uploadScorecard(blob, baseName, {
       teamA: M.teamNames.A, teamB: M.teamNames.B,
       resultText: M.resultText||'', resultSub: M.resultSub||'',
       potm: M.awards && M.awards.potm ? `${M.awards.potm.name} (${M.teamNames[M.awards.potm.team]})` : ''
     });
+    M.firebaseScorecardId = id;
+    saveState();
   }catch(e){
     console.warn('Auto scorecard upload to Firebase failed:', e.message);
   }finally{
@@ -1762,7 +1771,7 @@ function exportPDF(){
     const fbBtn = document.createElement('button');
     fbBtn.className = 'pr-print-btn';
     fbBtn.style.background = '#FFB23F'; fbBtn.style.color = '#111';
-    fbBtn.textContent = '🔥 Save scorecard to Firebase';
+    fbBtn.textContent = M.firebaseScorecardId ? '🔥 Re-save to Firebase (already saved once)' : '🔥 Save scorecard to Firebase';
     fbBtn.setAttribute('ontouchstart','');
     fbBtn.onclick = async ()=>{
       const originalLabel = fbBtn.textContent;
@@ -1773,12 +1782,18 @@ function exportPDF(){
         const previewEl = overlay.querySelector('.rk-pdf-source');
         const blob = await renderScorecardToPDFBlob(previewEl, baseName);
         if(!blob) throw new Error('Could not generate the PDF (no internet? html2pdf failed to load)');
-        await window.LiveSync.uploadScorecard(blob, baseName, {
+        // Reuse the existing id if this match was already auto-saved (or
+        // saved once before), so this overwrites that same entry instead
+        // of creating a duplicate "empty-looking" second one in the list.
+        const id = await window.LiveSync.uploadScorecard(blob, baseName, {
           teamA: M.teamNames.A, teamB: M.teamNames.B,
           resultText: M.resultText||'', resultSub: M.resultSub||'',
           potm: M.awards && M.awards.potm ? `${M.awards.potm.name} (${M.teamNames[M.awards.potm.team]})` : ''
-        });
+        }, M.firebaseScorecardId);
+        M.firebaseScorecardId = id;
+        saveState();
         fbBtn.textContent = '✅ Saved to Firebase';
+        setTimeout(()=>{ fbBtn.textContent = '🔥 Re-save to Firebase (already saved once)'; fbBtn.disabled = false; }, 2500);
       }catch(e){
         fbBtn.textContent = '❌ '+e.message;
         fbBtn.disabled = false;
