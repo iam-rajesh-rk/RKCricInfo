@@ -462,7 +462,6 @@
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
   import { getDatabase, ref, set, get, onValue, push } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
   import { getAuth, signInWithEmailAndPassword, signInAnonymously, signOut } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-  import { getStorage, ref as storageRef, uploadBytes, getDownloadURL } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyBHbGMdqknxhzhyt2mmF727t1pKd_YsNI4",
@@ -477,17 +476,21 @@
   const app = initializeApp(firebaseConfig);
   const db = getDatabase(app);
   const auth = getAuth(app);
-  const storage = getStorage(app);
 
   // Single shared match slot — fine for "one match happening at a time".
   // If you ever run two matches in parallel, read a ?match=xyz param and
   // use that as the path instead.
   const MATCH_PATH = 'matches/current';
-  // Where finished-match scorecard PDFs get uploaded (Firebase Storage),
-  // and where an index of them (with download URLs) is kept (Realtime DB)
-  // so past matches can be browsed later.
-  const SCORECARDS_STORAGE_DIR = 'scorecards';
+  // Finished-match scorecard PDFs are stored as base64 text directly in the
+  // Realtime Database — NOT Firebase Storage/Cloud Storage, because that
+  // requires upgrading to the paid Blaze plan just to create a bucket.
+  // Realtime Database stays on the free Spark plan. Split into two paths:
+  // - scorecards_index: small metadata only (teams, result, date) — fast
+  //   to list without pulling every PDF's bytes down just to show a list.
+  // - scorecards_files: the actual base64 PDF content, one entry per
+  //   scorecard, only fetched when someone actually opens/downloads it.
   const SCORECARDS_INDEX_PATH = 'scorecards_index';
+  const SCORECARDS_FILES_PATH = 'scorecards_files';
   // Shared squad details (team names + player lists), so anyone with the
   // page link sees the latest squads, and anyone who's entered the PIN
   // can update them — no GitHub token required for this part.
@@ -517,6 +520,27 @@
     if(auth.currentUser) return;
     try{ await signInAnonymously(auth); }
     catch(e){ console.warn('LiveSync: anonymous sign-in failed:', e.message); }
+  }
+
+  // Converts a Blob (the generated PDF) into a plain base64 string so it
+  // can be stored as a Realtime Database value — RTDB only stores JSON,
+  // no binary blobs, so this is the trick to keep everything on the free
+  // Spark plan without needing Cloud Storage.
+  function blobToBase64(blob){
+    return new Promise((resolve, reject)=>{
+      const reader = new FileReader();
+      reader.onload = ()=> resolve(reader.result.split(',')[1]); // strip "data:...;base64,"
+      reader.onerror = ()=> reject(new Error('Could not read the PDF file'));
+      reader.readAsDataURL(blob);
+    });
+  }
+  // Reverses blobToBase64 — turns the stored base64 string back into a
+  // real Blob the browser can open/download as a PDF.
+  function base64ToBlob(base64, mimeType){
+    const byteChars = atob(base64);
+    const byteNumbers = new Array(byteChars.length);
+    for(let i=0;i<byteChars.length;i++) byteNumbers[i] = byteChars.charCodeAt(i);
+    return new Blob([new Uint8Array(byteNumbers)], {type: mimeType});
   }
 
   window.LiveSync = {
@@ -626,31 +650,23 @@
     },
     signOut(){ signOut(auth); },
     isSignedIn(){ return !!auth.currentUser; },
-    // Uploads a finished match's scorecard PDF (Blob) to Firebase Storage
-    // and records it (with a download URL) in the Realtime Database so it
-    // can be found again later. Requires the device to be signed in (Live
-    // must be turned on) — Storage/Database rules should mirror that.
+    // Saves a finished match's scorecard PDF (Blob) into the Realtime
+    // Database as base64 text — split across scorecards_files (the heavy
+    // content) and scorecards_index (light metadata for listing).
+    // Requires the device to be signed in (Live must be turned on).
     // `meta` is a small plain object (team names, result text, etc.) —
     // passed in by the caller since this module can't see the app's `M`.
     async uploadScorecard(blob, baseName, meta){
       if(!auth.currentUser) throw new Error('Turn on Live (with the PIN) first, so this device is signed in.');
-      const path = SCORECARDS_STORAGE_DIR+'/'+baseName+'.pdf';
-      const fileRef = storageRef(storage, path);
-      await uploadBytes(fileRef, blob, {contentType:'application/pdf'});
-      const url = await getDownloadURL(fileRef);
-      try{
-        await push(ref(db, SCORECARDS_INDEX_PATH), Object.assign({}, meta||{}, {
-          url, storagePath: path, savedAt: Date.now()
-        }));
-      }catch(e){
-        // Index entry is best-effort — the PDF itself is already safely uploaded.
-        console.warn('LiveSync: scorecard index write failed:', e.message);
-      }
-      return url;
+      const pdfBase64 = await blobToBase64(blob);
+      const newRef = push(ref(db, SCORECARDS_INDEX_PATH));
+      const id = newRef.key;
+      await set(ref(db, SCORECARDS_FILES_PATH+'/'+id), { pdfBase64 });
+      await set(newRef, Object.assign({}, meta||{}, { baseName, savedAt: Date.now() }));
+      return id;
     },
-    // Lists every scorecard PDF that's been uploaded to Firebase (newest
-    // first), each with a direct download URL. Works for viewers too
-    // (anonymous read), not just the signed-in scorer.
+    // Lists every scorecard that's been saved (newest first) — metadata
+    // only (fast), no PDF content. Works for viewers too (anonymous read).
     async listScorecards(){
       await ensureReadAccess();
       try{
@@ -664,7 +680,17 @@
         console.warn('LiveSync: listScorecards failed:', e.message);
         return [];
       }
-    }
+    },
+    // Fetches one scorecard's actual PDF bytes (only called when someone
+    // taps to open/download a specific one) and returns a Blob the caller
+    // can turn into an object URL. Works for viewers too (anonymous read).
+    async downloadScorecard(id){
+      await ensureReadAccess();
+      const snap = await get(ref(db, SCORECARDS_FILES_PATH+'/'+id));
+      if(!snap.exists()) throw new Error('That scorecard is no longer available.');
+      const { pdfBase64 } = snap.val();
+      return base64ToBlob(pdfBase64, 'application/pdf');
+    },
   };
 </script>
 
@@ -1842,8 +1868,8 @@ function renderViewerMode(){
           ${item.potm ? `<div class="hint" style="margin:2px 0 0;">🏆 ${item.potm}</div>` : ''}
           <div class="hint" style="margin-top:4px;">${when}</div>
         </div>`);
-        const dl = el('<a class="btn-ghost" style="display:block; text-align:center; text-decoration:none; margin-top:8px;">⬇️ Open / Download PDF</a>');
-        dl.href = item.url; dl.target = '_blank'; dl.rel = 'noopener';
+        const dl = el('<button class="btn-ghost" style="display:block; width:100%; text-align:center; margin-top:8px;">⬇️ Open / Download PDF</button>');
+        dl.onclick = ()=> openScorecardPdf(item.id, dl);
         row.appendChild(dl);
         wrap.appendChild(row);
       });
@@ -1976,6 +2002,30 @@ async function loadFirebaseScorecardsIntoModal(){
     modal.loading = false;
     modal.items = items;
     render();
+  }
+}
+
+/* Fetches one scorecard's PDF bytes from Firebase on demand (they're
+   stored as base64 in the Realtime Database, not Cloud Storage — see the
+   LiveSync module for why) and opens it in a new tab via a blob URL.
+   Shared by both the in-app "📁 PDFs" modal and the viewer's scorecards
+   list, since both just need a button that fetches-then-opens by id. */
+async function openScorecardPdf(id, btn){
+  const original = btn.textContent;
+  btn.disabled = true; btn.textContent = '⏳ Loading…';
+  try{
+    const blob = await window.LiveSync.downloadScorecard(id);
+    const url = URL.createObjectURL(blob);
+    window.open(url, '_blank');
+    // Objects URLs are cheap to leak short-term, but clean up anyway once
+    // the new tab/viewer has had time to actually load it.
+    setTimeout(()=> URL.revokeObjectURL(url), 60000);
+  }catch(e){
+    btn.textContent = '❌ '+e.message;
+    setTimeout(()=>{ btn.textContent = original; }, 3000);
+  }finally{
+    btn.disabled = false;
+    if(btn.textContent === '⏳ Loading…') btn.textContent = original;
   }
 }
 
@@ -2156,14 +2206,17 @@ function renderSetupScreen(){
 
   if(saved) wrap.querySelector('#clearSquadBtn').onclick = ()=>{ clearSavedSquads(); render(); };
 
-  // Squad-library loaders: fill name + players from a saved squad
+  // Squad-library loaders: fill name + players from a saved squad.
+  // Always overwrite the name too — picking a squad from this dropdown is
+  // an explicit choice, so it shouldn't be silently skipped just because
+  // the name field already had something else in it (e.g. pre-filled from
+  // a previous match or a live sync from another device).
   const loadSquadA = wrap.querySelector('#loadSquadA');
   if(loadSquadA) loadSquadA.onchange = (e)=>{
     const sq = lib.find(s=>s.id===e.target.value);
     if(sq){
       wrap.querySelector('#teamAPlayers').value = sq.players.join('\n');
-      const nameInput = wrap.querySelector('#teamAName');
-      if(!nameInput.value.trim() || nameInput.value==='Team A') nameInput.value = sq.name;
+      wrap.querySelector('#teamAName').value = sq.name;
     }
   };
   const loadSquadB = wrap.querySelector('#loadSquadB');
@@ -2171,8 +2224,7 @@ function renderSetupScreen(){
     const sq = lib.find(s=>s.id===e.target.value);
     if(sq){
       wrap.querySelector('#teamBPlayers').value = sq.players.join('\n');
-      const nameInput = wrap.querySelector('#teamBName');
-      if(!nameInput.value.trim() || nameInput.value==='Team B') nameInput.value = sq.name;
+      wrap.querySelector('#teamBName').value = sq.name;
     }
   };
 
@@ -2913,8 +2965,8 @@ function renderModal(){
           ${item.potm ? `<div class="hint" style="margin:2px 0 0;">🏆 ${item.potm}</div>` : ''}
           <div class="hint" style="margin-top:4px;">${when}</div>
         </div>`);
-        const dl = el('<a class="btn-ghost" style="display:block; text-align:center; text-decoration:none; margin-top:8px;">⬇️ Open / Download PDF</a>');
-        dl.href = item.url; dl.target = '_blank'; dl.rel = 'noopener';
+        const dl = el('<button class="btn-ghost" style="display:block; width:100%; text-align:center; margin-top:8px;">⬇️ Open / Download PDF</button>');
+        dl.onclick = ()=> openScorecardPdf(item.id, dl);
         row.appendChild(dl);
         m.appendChild(row);
       });
