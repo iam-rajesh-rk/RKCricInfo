@@ -461,7 +461,7 @@
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
   import { getDatabase, ref, set, get, onValue, push } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
-  import { getAuth, signInWithEmailAndPassword, signInAnonymously, signOut } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+  import { getAuth, signInWithEmailAndPassword, signInAnonymously, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyBHbGMdqknxhzhyt2mmF727t1pKd_YsNI4",
@@ -513,10 +513,25 @@
   let squadsWriteTimer = null;
   let libraryWriteTimer = null;
 
+  // On page load, if the browser has a PERSISTED sign-in session from a
+  // previous visit (Firebase Auth caches this in IndexedDB by default),
+  // `auth.currentUser` can appear populated ("Live" shows green) before
+  // the SDK has actually finished re-validating that session's ID token
+  // with Google's servers. Firing a read/write in that narrow window
+  // fails with permission_denied even though the UI already says
+  // "signed in" — which is exactly the "works after toggling Live
+  // off/on" symptom. onAuthStateChanged fires once auth genuinely
+  // settles (restored + token valid, or confirmed signed-out); every
+  // read/write below waits on this before doing anything.
+  let authReadyResolve;
+  const authReady = new Promise(resolve=>{ authReadyResolve = resolve; });
+  onAuthStateChanged(auth, ()=> authReadyResolve(), ()=> authReadyResolve());
+
   // Makes sure *some* auth session exists before a read, so Database Rules
   // requiring `auth != null` don't block viewers who never enter the PIN.
   // No-ops if already signed in (as scorer or anonymously).
   async function ensureReadAccess(){
+    await authReady;
     if(auth.currentUser) return;
     try{ await signInAnonymously(auth); }
     catch(e){ console.warn('LiveSync: anonymous sign-in failed:', e.message); }
@@ -548,7 +563,8 @@
     // burst of taps (e.g. undo spam) doesn't fire a write per tap.
     push(matchState){
       clearTimeout(writeTimer);
-      writeTimer = setTimeout(()=>{
+      writeTimer = setTimeout(async ()=>{
+        await authReady;
         set(ref(db, MATCH_PATH), matchState).catch(e=>{
           console.warn('LiveSync: push failed (probably not signed in):', e.message);
         });
@@ -559,7 +575,8 @@
     // same as push() above.
     pushSquads(squadsPayload){
       clearTimeout(squadsWriteTimer);
-      squadsWriteTimer = setTimeout(()=>{
+      squadsWriteTimer = setTimeout(async ()=>{
+        await authReady;
         set(ref(db, SQUADS_PATH), squadsPayload).catch(e=>{
           console.warn('LiveSync: squads push failed (probably not signed in):', e.message);
         });
@@ -570,6 +587,7 @@
     // that needs to show real success/failure feedback, rather than the
     // silent best-effort auto-sync that happens when starting a match.
     async pushSquadsNow(squadsPayload){
+      await authReady;
       if(!auth.currentUser) throw new Error('Turn on Live (with the PIN) first, so this device is signed in.');
       await set(ref(db, SQUADS_PATH), squadsPayload);
     },
@@ -600,7 +618,8 @@
     // silent-on-failure pattern as pushSquads() above.
     pushLibrary(libraryPayload){
       clearTimeout(libraryWriteTimer);
-      libraryWriteTimer = setTimeout(()=>{
+      libraryWriteTimer = setTimeout(async ()=>{
+        await authReady;
         set(ref(db, LIBRARY_PATH), libraryPayload).catch(e=>{
           console.warn('LiveSync: library push failed (probably not signed in):', e.message);
         });
@@ -657,6 +676,7 @@
     // `meta` is a small plain object (team names, result text, etc.) —
     // passed in by the caller since this module can't see the app's `M`.
     async uploadScorecard(blob, baseName, meta){
+      await authReady;
       if(!auth.currentUser) throw new Error('Turn on Live (with the PIN) first, so this device is signed in.');
       const pdfBase64 = await blobToBase64(blob);
       const newRef = push(ref(db, SCORECARDS_INDEX_PATH));
