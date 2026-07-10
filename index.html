@@ -2232,21 +2232,36 @@ function renderSetupScreen(){
   // the name field already had something else in it (e.g. pre-filled from
   // a previous match or a live sync from another device).
   const loadSquadA = wrap.querySelector('#loadSquadA');
+  const loadSquadB = wrap.querySelector('#loadSquadB');
+  // Disables whichever squad is picked on one side from being pickable on
+  // the other side too — two teams shouldn't both be the same saved squad.
+  function syncSquadDropdownExclusion(){
+    if(!loadSquadA || !loadSquadB) return;
+    Array.from(loadSquadB.options).forEach(opt=>{
+      opt.disabled = !!opt.value && opt.value === loadSquadA.value;
+    });
+    Array.from(loadSquadA.options).forEach(opt=>{
+      opt.disabled = !!opt.value && opt.value === loadSquadB.value;
+    });
+  }
   if(loadSquadA) loadSquadA.onchange = (e)=>{
     const sq = lib.find(s=>s.id===e.target.value);
     if(sq){
       wrap.querySelector('#teamAPlayers').value = sq.players.join('\n');
       wrap.querySelector('#teamAName').value = sq.name;
     }
+    syncSquadDropdownExclusion();
   };
-  const loadSquadB = wrap.querySelector('#loadSquadB');
   if(loadSquadB) loadSquadB.onchange = (e)=>{
     const sq = lib.find(s=>s.id===e.target.value);
     if(sq){
       wrap.querySelector('#teamBPlayers').value = sq.players.join('\n');
       wrap.querySelector('#teamBName').value = sq.name;
     }
+    syncSquadDropdownExclusion();
   };
+  syncSquadDropdownExclusion(); // in case pre-saved squads happened to match on load
+
 
   // Keep Innings-2 overs in sync with Innings-1 until the user edits it directly
   const ov1 = wrap.querySelector('#oversLimit1'), ov2 = wrap.querySelector('#oversLimit2');
