@@ -461,7 +461,7 @@
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
   import { getDatabase, ref, set, get, onValue, push } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
-  import { getAuth, signInWithEmailAndPassword, signInAnonymously, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+  import { getAuth, signInWithEmailAndPassword, signInAnonymously, signOut, onAuthStateChanged, setPersistence, inMemoryPersistence } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyBHbGMdqknxhzhyt2mmF727t1pKd_YsNI4",
@@ -513,19 +513,26 @@
   let squadsWriteTimer = null;
   let libraryWriteTimer = null;
 
-  // On page load, if the browser has a PERSISTED sign-in session from a
-  // previous visit (Firebase Auth caches this in IndexedDB by default),
-  // `auth.currentUser` can appear populated ("Live" shows green) before
-  // the SDK has actually finished re-validating that session's ID token
-  // with Google's servers. Firing a read/write in that narrow window
-  // fails with permission_denied even though the UI already says
-  // "signed in" — which is exactly the "works after toggling Live
-  // off/on" symptom. onAuthStateChanged fires once auth genuinely
-  // settles (restored + token valid, or confirmed signed-out); every
-  // read/write below waits on this before doing anything.
+  // By design, this app should be fully offline/read-nothing until the
+  // scorer explicitly turns "Live" on with the PIN — no auto-restoring a
+  // sign-in from a previous visit. Besides matching that (Firebase Auth
+  // defaults to persisting sessions in IndexedDB across visits), this
+  // also sidesteps a nasty race: a restored session can make
+  // auth.currentUser appear populated ("Live" shows green) before the
+  // SDK has actually re-validated that session's token with Google's
+  // servers, so an early read/write fails with permission_denied even
+  // though the UI already says "signed in" — the "stuck, only works
+  // after toggling Live off/on" symptom. inMemoryPersistence means there
+  // is nothing to restore in the first place: every fresh page load
+  // starts fully signed out, and onAuthStateChanged fires almost
+  // immediately (no async storage lookup needed).
   let authReadyResolve;
   const authReady = new Promise(resolve=>{ authReadyResolve = resolve; });
-  onAuthStateChanged(auth, ()=> authReadyResolve(), ()=> authReadyResolve());
+  setPersistence(auth, inMemoryPersistence)
+    .catch(e=> console.warn('LiveSync: setPersistence failed:', e.message))
+    .finally(()=>{
+      onAuthStateChanged(auth, ()=> authReadyResolve(), ()=> authReadyResolve());
+    });
 
   // Makes sure *some* auth session exists before a read, so Database Rules
   // requiring `auth != null` don't block viewers who never enter the PIN.
@@ -561,7 +568,10 @@
   window.LiveSync = {
     // Called after every render() on the scorer's device. Debounced so a
     // burst of taps (e.g. undo spam) doesn't fire a write per tap.
+    // Skips entirely (not even a debounce timer) if not signed in, so a
+    // fully-offline session never makes a single Firebase network call.
     push(matchState){
+      if(!auth.currentUser) return;
       clearTimeout(writeTimer);
       writeTimer = setTimeout(async ()=>{
         await authReady;
@@ -574,6 +584,7 @@
     // sign-in as scoring gates this — silently no-ops if not signed in,
     // same as push() above.
     pushSquads(squadsPayload){
+      if(!auth.currentUser) return;
       clearTimeout(squadsWriteTimer);
       squadsWriteTimer = setTimeout(async ()=>{
         await authReady;
@@ -617,6 +628,7 @@
     // is Live-signed-in with the PIN. Same debounced, best-effort,
     // silent-on-failure pattern as pushSquads() above.
     pushLibrary(libraryPayload){
+      if(!auth.currentUser) return;
       clearTimeout(libraryWriteTimer);
       libraryWriteTimer = setTimeout(async ()=>{
         await authReady;
@@ -2000,11 +2012,14 @@ function renderTopbar(){
     if(!pin) return;
     const ok = await window.LiveSync.signIn(pin);
     if(!ok){ alert('Wrong PIN.'); render(); return; }
-    // This device is now signed in. If a match is already live in Firebase
-    // (e.g. started from another device), pull it down so this device
-    // shows the current live score and can carry on updating it — instead
-    // of silently starting a brand-new blank match and overwriting it.
+    // This device is now signed in. Since Firebase is untouched until
+    // this point (offline by default), catch this device up on
+    // everything shared: the squads, the player library, and — if a
+    // match is already live (e.g. started from another device) — the
+    // match itself, so this device shows the current state and can
+    // carry on, instead of silently starting fresh and overwriting it.
     try{
+      await Promise.all([ pullFirebaseSquadsNow(), pullFirebaseLibraryNow() ]);
       const remote = await window.LiveSync.pullOnce();
       if(remote && remote.teamNames){
         const localInProgress = M.stage!=='setup';
@@ -2017,7 +2032,7 @@ function renderTopbar(){
           undoStack = []; // no shared undo history across devices
         }
       }
-    }catch(e){ console.warn('Could not check for an existing live match:', e.message); }
+    }catch(e){ console.warn('Could not fetch current live details:', e.message); }
     render();
   };
   btnWrap.appendChild(live);
@@ -3063,46 +3078,26 @@ if(githubCanRead()){
   });
 }
 
-/* Also pull shared squads from Firebase — this works for EVERYONE who
-   opens the link (no GitHub token needed at all), since reading only
-   needs the anonymous sign-in LiveSync does automatically. Only WRITING
-   squads back (in startMatchFromForm) requires the PIN. Runs after the
-   GitHub pull so Firebase — the live, PIN-gated source — wins if both
-   happen to be configured.
-   window.LiveSync is set by a <script type="module"> tag, which (being a
-   module) is deferred and hasn't necessarily run yet by the time this
-   plain script finishes executing — so poll briefly rather than checking
-   window.LiveSync just once synchronously here. */
-function tryPullFirebaseSquads(retriesLeft){
-  if(window.LiveSync){
-    window.LiveSync.pullSquadsOnce().then(remote=>{
-      if(remote && remote.teamNames && remote.squads){
-        localStorage.setItem(SQUADS_KEY, JSON.stringify(remote));
-        if(M.stage==='setup' && !showPlayerManager) render();
-      }
-    });
-  } else if(retriesLeft > 0){
-    setTimeout(()=>tryPullFirebaseSquads(retriesLeft-1), 200);
+/* Deliberately offline-by-default: unlike GitHub Sync above (read-only,
+   no auth needed), Firebase is never touched at boot at all — no
+   sign-in restore, no anonymous read, nothing — so a plain page load
+   has zero Firebase network activity and can't get stuck waiting on it.
+   Firebase only switches on once the scorer explicitly turns "Live" on
+   with the PIN; at that point pullFirebaseSquadsNow()/pullFirebaseLibraryNow()
+   (defined below, called from the Live button's onclick) fetch the
+   current shared squads/library so this device is caught up immediately. */
+async function pullFirebaseSquadsNow(){
+  if(!window.LiveSync) return;
+  const remote = await window.LiveSync.pullSquadsOnce();
+  if(remote && remote.teamNames && remote.squads){
+    localStorage.setItem(SQUADS_KEY, JSON.stringify(remote));
   }
 }
-tryPullFirebaseSquads(25); // ~5s of retrying while the Firebase SDK modules load
-
-/* Same idea, but for the "Manage Players" saved-squads library: pull the
-   shared library once on load so squads saved on another device (with
-   Live+PIN) show up here too, without needing GitHub Sync configured. */
-function tryPullFirebaseLibrary(retriesLeft){
-  if(window.LiveSync){
-    window.LiveSync.pullLibraryOnce().then(remote=>{
-      if(Array.isArray(remote)){
-        savePlayerLibrary(remote);
-        if(showPlayerManager) render();
-      }
-    });
-  } else if(retriesLeft > 0){
-    setTimeout(()=>tryPullFirebaseLibrary(retriesLeft-1), 200);
-  }
+async function pullFirebaseLibraryNow(){
+  if(!window.LiveSync) return;
+  const remote = await window.LiveSync.pullLibraryOnce();
+  if(Array.isArray(remote)) savePlayerLibrary(remote);
 }
-tryPullFirebaseLibrary(25);
 </script>
 </body>
 </html>
