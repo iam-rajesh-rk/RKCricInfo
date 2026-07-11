@@ -2010,17 +2010,23 @@ function renderTopbar(){
     }
     const pin = prompt('Enter scoring PIN to start broadcasting live:');
     if(!pin) return;
-    const ok = await window.LiveSync.signIn(pin);
-    if(!ok){ alert('Wrong PIN.'); render(); return; }
-    // This device is now signed in. Since Firebase is untouched until
-    // this point (offline by default), catch this device up on
-    // everything shared: the squads, the player library, and — if a
-    // match is already live (e.g. started from another device) — the
-    // match itself, so this device shows the current state and can
-    // carry on, instead of silently starting fresh and overwriting it.
+
+    // Visible feedback from here on — this used to run fully silently,
+    // so if any step was slow (or hung) it looked like "nothing
+    // happened" even when it was genuinely still working (or genuinely
+    // stuck). Every step now updates the button text, and the whole
+    // thing has a hard 15s timeout so it can never hang forever.
+    live.disabled = true;
+    live.textContent = '⏳ Checking PIN…';
     try{
-      await Promise.all([ pullFirebaseSquadsNow(), pullFirebaseLibraryNow() ]);
-      const remote = await window.LiveSync.pullOnce();
+      const ok = await withTimeout(window.LiveSync.signIn(pin), 15000);
+      if(!ok){ alert('Wrong PIN.'); live.textContent = '🔒 Live off'; return; }
+
+      live.textContent = '⏳ Fetching squads…';
+      await withTimeout(Promise.all([ pullFirebaseSquadsNow(), pullFirebaseLibraryNow() ]), 15000);
+
+      live.textContent = '⏳ Checking for a live match…';
+      const remote = await withTimeout(window.LiveSync.pullOnce(), 15000);
       if(remote && remote.teamNames){
         const localInProgress = M.stage!=='setup';
         const takeOver = !localInProgress || confirm(
@@ -2032,11 +2038,32 @@ function renderTopbar(){
           undoStack = []; // no shared undo history across devices
         }
       }
-    }catch(e){ console.warn('Could not fetch current live details:', e.message); }
-    render();
+      live.textContent = '🟢 Live';
+    }catch(e){
+      console.warn('Could not fully connect to Live:', e.message);
+      // Sign-in itself may still have succeeded even if a later step
+      // (squads/library/match fetch) timed out — reflect whatever the
+      // real current state is rather than guessing.
+      live.textContent = (window.LiveSync && window.LiveSync.isSignedIn())
+        ? '🟢 Live (partial sync — check connection)'
+        : '🔒 Live off';
+    }finally{
+      live.disabled = false;
+      render();
+    }
   };
   btnWrap.appendChild(live);
   return bar;
+}
+
+/* Races a promise against a timeout so a hung Firebase call (e.g. a
+   genuinely offline device) can never leave the UI stuck showing
+   "nothing happened" forever — always settles one way or another. */
+function withTimeout(promise, ms){
+  return Promise.race([
+    promise,
+    new Promise((_, reject)=> setTimeout(()=> reject(new Error('Timed out — check your internet connection')), ms))
+  ]);
 }
 
 /* Fetches the list of uploaded scorecard PDFs from Firebase in the
