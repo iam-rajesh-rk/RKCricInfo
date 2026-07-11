@@ -1644,13 +1644,27 @@ async function autoPushFinishedScorecardToFirebase(){
   if(VIEW_MODE || M.firebaseScorecardId || !(window.LiveSync && window.LiveSync.isSignedIn())) return;
   const holder = document.createElement('div');
   holder.className = 'rk-pdf-source';
-  holder.style.cssText = 'position:fixed; left:-9999px; top:0; width:800px;';
+  // Kept within normal viewport coordinates (not thousands of pixels
+  // off-screen) — html2canvas can fail to properly measure/capture
+  // elements positioned far outside the viewport, silently producing a
+  // blank page. opacity+pointer-events keeps it invisible and
+  // non-interactive without moving it away from (0,0).
+  holder.style.cssText = 'position:fixed; top:0; left:0; width:800px; opacity:0.01; pointer-events:none; z-index:-1;';
   try{
     holder.innerHTML = buildScorecardHTML();
     document.body.appendChild(holder);
+    // Give the browser a couple of frames to actually commit layout/paint
+    // for the freshly-inserted content before html2canvas captures it.
+    await new Promise(r=> requestAnimationFrame(()=> requestAnimationFrame(r)));
     const baseName = scorecardFilename().replace(/\.html$/,'');
     const blob = await renderScorecardToPDFBlob(holder, baseName);
-    if(!blob) return;
+    // A real scorecard PDF (even a short one) is comfortably over this —
+    // a suspiciously tiny file almost always means html2canvas captured
+    // a blank/near-empty page. Skip uploading it rather than saving an
+    // empty-looking entry; the manual "Save scorecard to Firebase"
+    // button (run with the export overlay actually visible on-screen)
+    // remains available to retry.
+    if(!blob || blob.size < 3000) return;
     const id = await window.LiveSync.uploadScorecard(blob, baseName, {
       teamA: M.teamNames.A, teamB: M.teamNames.B,
       resultText: M.resultText||'', resultSub: M.resultSub||'',
@@ -1798,7 +1812,7 @@ function exportPDF(){
         const baseName = scorecardFilename().replace(/\.html$/,'');
         const previewEl = overlay.querySelector('.rk-pdf-source');
         const blob = await renderScorecardToPDFBlob(previewEl, baseName);
-        if(!blob) throw new Error('Could not generate the PDF (no internet? html2pdf failed to load)');
+        if(!blob || blob.size < 3000) throw new Error('Could not generate the PDF (no internet? html2pdf failed to load, or the preview was blank)');
         // Reuse the existing id if this match was already auto-saved (or
         // saved once before), so this overwrites that same entry instead
         // of creating a duplicate "empty-looking" second one in the list.
@@ -1950,6 +1964,8 @@ function renderViewerMode(){
       <h2 style="font-size:40px;">${inn.totalRuns}/${inn.totalWkts}</h2>
       <span style="color:var(--muted); font-size:16px;">(${oversStr(inn)} ov)</span>
     </div>
+    <div class="sb-overs">Overs ${oversStr(inn)} of ${oversForInnings(vm.curInnIdx)} · CRR ${crr(inn)}</div>
+    ${inn.target!==null ? `<div class="sb-target">Target ${inn.target} · need ${Math.max(inn.target-inn.totalRuns,0)} runs · RRR ${rrr(inn)}</div>` : ''}
   </div>`);
   app.appendChild(sb);
   if(vm.resultText){
@@ -2007,67 +2023,18 @@ function renderTopbar(){
   const live = document.createElement('button'); live.className='iconbtn';
   const signedIn = window.LiveSync && window.LiveSync.isSignedIn();
   live.textContent = signedIn ? '🟢 Live' : '🔒 Live off';
-  live.onclick = async ()=>{
+  live.onclick = ()=>{
     if(!window.LiveSync){ alert('Live sync is still loading, try again in a second.'); return; }
     if(signedIn){
       if(confirm('Stop broadcasting live scores from this device?')){ window.LiveSync.signOut(); render(); }
       return;
     }
-    const pin = prompt('Enter scoring PIN to start broadcasting live:');
-    if(!pin) return;
-
-    // Visible feedback from here on — this used to run fully silently,
-    // so if any step was slow (or hung) it looked like "nothing
-    // happened" even when it was genuinely still working (or genuinely
-    // stuck). Every step now updates the button text, and the whole
-    // thing has a hard 15s timeout so it can never hang forever.
-    live.disabled = true;
-    live.textContent = '⏳ Checking PIN…';
-    try{
-      const result = await withTimeout(window.LiveSync.signIn(pin), 15000);
-      if(!result.ok){
-        const friendly = {
-          'auth/wrong-password': 'Wrong PIN.',
-          'auth/invalid-credential': 'Wrong PIN.',
-          'auth/user-not-found': 'No scorer account exists yet for this email — check Firebase Console → Authentication → Users.',
-          'auth/too-many-requests': 'Too many attempts — Firebase has temporarily blocked sign-in. Wait a few minutes and try again.',
-          'auth/network-request-failed': 'Network request failed — check your internet connection (or a firewall/VDI network policy blocking Firebase).',
-          'auth/operation-not-allowed': 'Email/Password sign-in isn\'t enabled for this project — check Firebase Console → Authentication → Sign-in method.'
-        }[result.code];
-        alert(friendly || ('Sign-in failed: '+(result.code || result.message)));
-        live.textContent = '🔒 Live off';
-        return;
-      }
-
-      live.textContent = '⏳ Fetching squads…';
-      await withTimeout(Promise.all([ pullFirebaseSquadsNow(), pullFirebaseLibraryNow() ]), 15000);
-
-      live.textContent = '⏳ Checking for a live match…';
-      const remote = await withTimeout(window.LiveSync.pullOnce(), 15000);
-      if(remote && remote.teamNames){
-        const localInProgress = M.stage!=='setup';
-        const takeOver = !localInProgress || confirm(
-          'A live match is already running on Firebase ('+remote.teamNames.A+' vs '+remote.teamNames.B+').\n\n'+
-          'Load it onto this device and continue scoring? (Your current unsent match on this device will be replaced.)'
-        );
-        if(takeOver){
-          M = normalizeMatch(remote);
-          undoStack = []; // no shared undo history across devices
-        }
-      }
-      live.textContent = '🟢 Live';
-    }catch(e){
-      console.warn('Could not fully connect to Live:', e.message);
-      // Sign-in itself may still have succeeded even if a later step
-      // (squads/library/match fetch) timed out — reflect whatever the
-      // real current state is rather than guessing.
-      live.textContent = (window.LiveSync && window.LiveSync.isSignedIn())
-        ? '🟢 Live (partial sync — check connection)'
-        : '🔒 Live off';
-    }finally{
-      live.disabled = false;
-      render();
-    }
+    // An in-app modal instead of the native prompt() — mobile Chrome
+    // (iOS and Android) is inconsistent about showing/allowing prompt()
+    // dialogs, which made "Live" silently do nothing on some phones even
+    // though the exact same tap worked fine in Edge/desktop.
+    modal = {type:'livePinEntry'};
+    render();
   };
   btnWrap.appendChild(live);
   return bar;
@@ -2081,6 +2048,46 @@ function withTimeout(promise, ms){
     promise,
     new Promise((_, reject)=> setTimeout(()=> reject(new Error('Timed out — check your internet connection')), ms))
   ]);
+}
+
+/* Shared PIN-sign-in flow, used by the "🔒 Live off" modal. Updates
+   `setStatus` with progress as it goes (so it's never silently stuck),
+   and on success either loads a match already live elsewhere (via a
+   modal confirm, not native confirm()) or just closes out. */
+async function connectLiveWithPin(pin, setStatus){
+  setStatus('⏳ Checking PIN…');
+  const result = await withTimeout(window.LiveSync.signIn(pin), 15000);
+  if(!result.ok){
+    const friendly = {
+      'auth/wrong-password': 'Wrong PIN.',
+      'auth/invalid-credential': 'Wrong PIN.',
+      'auth/user-not-found': 'No scorer account exists yet for this email — check Firebase Console → Authentication → Users.',
+      'auth/too-many-requests': 'Too many attempts — Firebase has temporarily blocked sign-in. Wait a few minutes and try again.',
+      'auth/network-request-failed': 'Network request failed — check your internet connection (or a firewall/VDI network policy blocking Firebase).',
+      'auth/operation-not-allowed': 'Email/Password sign-in isn\'t enabled for this project — check Firebase Console → Authentication → Sign-in method.'
+    }[result.code];
+    throw new Error(friendly || ('Sign-in failed: '+(result.code || result.message)));
+  }
+
+  setStatus('⏳ Fetching squads…');
+  await withTimeout(Promise.all([ pullFirebaseSquadsNow(), pullFirebaseLibraryNow() ]), 15000);
+
+  setStatus('⏳ Checking for a live match…');
+  const remote = await withTimeout(window.LiveSync.pullOnce(), 15000);
+  if(remote && remote.teamNames){
+    const localInProgress = M.stage!=='setup';
+    if(localInProgress){
+      // Ask via a modal (not native confirm()) for the same cross-browser
+      // reliability reason as the PIN entry above.
+      modal = {type:'liveTakeoverConfirm', remote};
+      render();
+      return;
+    }
+    M = normalizeMatch(remote);
+    undoStack = [];
+  }
+  modal = null;
+  render();
 }
 
 /* Fetches the list of uploaded scorecard PDFs from Firebase in the
@@ -2672,6 +2679,17 @@ function renderBetweenScreen(){
   btn.querySelector('.btn-primary').onclick = startSecondInnings;
   btn.querySelector('.btn-ghost').onclick = ()=>{ modal={type:'scorecard'}; render(); };
   wrap.appendChild(btn);
+
+  // Nudge to sync before the 2nd innings starts, if this device isn't
+  // already broadcasting live — once signed in, every subsequent update
+  // (including the 2nd innings starting) syncs automatically on its own.
+  if(!(window.LiveSync && window.LiveSync.isSignedIn())){
+    const nudge = el(`<div class="wrap" style="padding-top:0;">
+      <button class="btn-ghost" style="color:var(--lime); border-color:var(--lime);">🔒 Enable Live to sync the 2nd innings for everyone</button>
+    </div>`);
+    nudge.querySelector('button').onclick = ()=>{ modal={type:'livePinEntry'}; render(); };
+    wrap.appendChild(nudge);
+  }
   return wrap;
 }
 
@@ -2715,7 +2733,52 @@ function renderModal(){
   overlay.appendChild(m);
   overlay.onclick = (e)=>{ if(e.target===overlay && (modal.type==='scorecard')){ modal=null; render(); } };
 
-  if(modal.type==='noballRuns'){
+  if(modal.type==='livePinEntry'){
+    m.appendChild(el('<h3>🔒 Enter scoring PIN</h3>'));
+    m.appendChild(el('<p class="hint" style="margin-bottom:14px;">This turns on Live — syncing the score, squads, and player library for anyone with this page\'s link.</p>'));
+    const input = el('<input type="password" inputmode="numeric" autocomplete="off" placeholder="PIN" style="width:100%; box-sizing:border-box; padding:12px 14px; border-radius:10px; border:1px solid var(--border); background:var(--surface2); color:var(--text); font-size:16px; margin-bottom:10px;">');
+    m.appendChild(input);
+    const statusLine = el('<p class="hint" style="min-height:18px;"></p>');
+    m.appendChild(statusLine);
+    const connectBtn = el('<button class="btn-primary" style="margin-top:4px;">Connect</button>');
+    connectBtn.onclick = async ()=>{
+      const pin = input.value.trim();
+      if(!pin){ statusLine.textContent = 'Enter a PIN first.'; return; }
+      connectBtn.disabled = true; input.disabled = true;
+      try{
+        await connectLiveWithPin(pin, (t)=>{ statusLine.textContent = t; });
+        // connectLiveWithPin itself calls render() on success (either
+        // closing this modal or opening the takeover-confirm one), so
+        // nothing further needed here on the happy path.
+      }catch(e){
+        statusLine.textContent = '❌ '+e.message;
+        connectBtn.disabled = false; input.disabled = false;
+      }
+    };
+    m.appendChild(connectBtn);
+    const cancel = el('<button class="modal-close" style="margin-top:8px;">Cancel</button>');
+    cancel.onclick = ()=>{ modal=null; render(); };
+    m.appendChild(cancel);
+    input.onkeydown = (e)=>{ if(e.key==='Enter'){ e.preventDefault(); connectBtn.click(); } };
+    setTimeout(()=> input.focus(), 50);
+  }
+  else if(modal.type==='liveTakeoverConfirm'){
+    const remote = modal.remote;
+    m.appendChild(el('<h3>Live match found</h3>'));
+    m.appendChild(el(`<p class="hint" style="margin-bottom:16px;">A live match is already running on Firebase (<b>${remote.teamNames.A}</b> vs <b>${remote.teamNames.B}</b>). Load it onto this device and continue scoring? Your current unsent match on this device will be replaced.</p>`));
+    const yes = el('<button class="btn-primary">Load it and continue scoring</button>');
+    yes.onclick = ()=>{
+      M = normalizeMatch(remote);
+      undoStack = [];
+      modal = null;
+      render();
+    };
+    m.appendChild(yes);
+    const no = el('<button class="btn-ghost" style="margin-top:8px;">Keep my current match instead</button>');
+    no.onclick = ()=>{ modal=null; render(); };
+    m.appendChild(no);
+  }
+  else if(modal.type==='noballRuns'){
     m.appendChild(el('<h3>No ball — runs off the bat</h3>'));
     const grid = el('<div class="opt-grid" style="grid-template-columns:repeat(4,1fr);"></div>');
     [0,1,2,3,4,6].forEach(r=>{
