@@ -675,9 +675,14 @@
         return null;
       }
     },
+    // Returns {ok:true} on success, or {ok:false, code, message} on
+    // failure — the caller shows the real reason instead of always
+    // assuming "wrong PIN", since the same failure also happens for e.g.
+    // a blocked network request, a deleted account, or a disabled
+    // sign-in provider, which each need a different fix.
     async signIn(pin){
-      try{ await signInWithEmailAndPassword(auth, SCORER_EMAIL, pin); return true; }
-      catch(e){ return false; }
+      try{ await signInWithEmailAndPassword(auth, SCORER_EMAIL, pin); return {ok:true}; }
+      catch(e){ return {ok:false, code:e.code||'', message:e.message||String(e)}; }
     },
     signOut(){ signOut(auth); },
     isSignedIn(){ return !!auth.currentUser; },
@@ -2019,8 +2024,20 @@ function renderTopbar(){
     live.disabled = true;
     live.textContent = '⏳ Checking PIN…';
     try{
-      const ok = await withTimeout(window.LiveSync.signIn(pin), 15000);
-      if(!ok){ alert('Wrong PIN.'); live.textContent = '🔒 Live off'; return; }
+      const result = await withTimeout(window.LiveSync.signIn(pin), 15000);
+      if(!result.ok){
+        const friendly = {
+          'auth/wrong-password': 'Wrong PIN.',
+          'auth/invalid-credential': 'Wrong PIN.',
+          'auth/user-not-found': 'No scorer account exists yet for this email — check Firebase Console → Authentication → Users.',
+          'auth/too-many-requests': 'Too many attempts — Firebase has temporarily blocked sign-in. Wait a few minutes and try again.',
+          'auth/network-request-failed': 'Network request failed — check your internet connection (or a firewall/VDI network policy blocking Firebase).',
+          'auth/operation-not-allowed': 'Email/Password sign-in isn\'t enabled for this project — check Firebase Console → Authentication → Sign-in method.'
+        }[result.code];
+        alert(friendly || ('Sign-in failed: '+(result.code || result.message)));
+        live.textContent = '🔒 Live off';
+        return;
+      }
 
       live.textContent = '⏳ Fetching squads…';
       await withTimeout(Promise.all([ pullFirebaseSquadsNow(), pullFirebaseLibraryNow() ]), 15000);
