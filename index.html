@@ -2197,7 +2197,13 @@ async function loadCheckpointsIntoModal(){
   const items = await window.LiveSync.listCheckpoints();
   if(modal && modal.type==='recoverCheckpoints'){
     modal.loading = false;
-    modal.items = items;
+    // Only the 2 most recent are shown — this is specifically for the
+    // "oops, ended the innings/match by mistake" case: the newest entry
+    // is almost always the mistake itself, and the one right before it is
+    // the last good state to jump back to. (Firebase still keeps a few
+    // more than 2 behind the scenes as extra safety margin, but surfacing
+    // all of them here just adds noise for this use case.)
+    modal.items = items.slice(0, 2);
     render();
   }
 }
@@ -3093,7 +3099,13 @@ function renderModal(){
       const inn = curInn();
       inn.done = true;
       undoStack = []; // clear history so it can't leak into the next innings
-      if(M.curInnIdx===0){ M.stage='between'; } else { M.stage='finished'; computeResult(); autoPushFinishedScorecardToFirebase(); }
+      if(M.curInnIdx===0){
+        M.stage='between';
+        saveCheckpointNow('End of 1st innings (manually ended) — '+M.teamNames[inn.battingTeam]+' '+inn.totalRuns+'/'+inn.totalWkts);
+      } else {
+        M.stage='finished'; computeResult(); autoPushFinishedScorecardToFirebase();
+        saveCheckpointNow('Match finished (manually ended) — '+(M.resultText||''));
+      }
       modal=null; render();
     };
     const no = el('<button class="modal-close">Cancel</button>');
@@ -3260,10 +3272,10 @@ function renderModal(){
   else if(modal.type==='recoverCheckpoints'){
     m.appendChild(el('<h3>⏮ Recover previous score</h3>'));
     m.appendChild(el(`<p class="hint" style="margin-bottom:14px;">
-      Auto-saved checkpoints from this live match — one is saved after every over, after each
-      innings ends, and when the match finishes. If the app crashed, closed, or lost its state,
-      pick one below to load it onto this device and carry on scoring from there. This replaces
-      whatever match is currently on this device.
+      The last 2 auto-saved checkpoints for this match — one is saved after every over, after each
+      innings ends, and when the match finishes. Ended an innings or the match by mistake? The
+      newest entry below is usually that mistake — pick the one above it to jump back and carry
+      on scoring. Loading a checkpoint replaces whatever match is currently on this device.
     </p>`));
     if(modal.loading){
       m.appendChild(el('<p class="hint">Loading…</p>'));
@@ -3272,11 +3284,13 @@ function renderModal(){
     } else if(!modal.items || modal.items.length===0){
       m.appendChild(el('<p class="hint">No checkpoints saved yet — these only start appearing once Live is turned on and at least one over is bowled.</p>'));
     } else {
-      modal.items.forEach(item=>{
+      modal.items.forEach((item, idx)=>{
         const when = item.savedAt ? new Date(item.savedAt).toLocaleString('en-GB',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
         const state = item.state || {};
         const teamLine = state.teamNames ? (state.teamNames.A+' vs '+state.teamNames.B) : '';
+        const tag = idx===0 ? 'Latest' : 'Previous';
         const row = el(`<div class="card" style="padding:12px 14px; margin-bottom:10px;">
+          <div class="hint" style="margin:0 0 4px; text-transform:uppercase; letter-spacing:.03em; font-size:11px;">${tag}</div>
           ${teamLine ? `<div style="font-weight:600;">${teamLine}</div>` : ''}
           <div class="hint" style="margin:2px 0 0;">${item.label||'Checkpoint'}</div>
           <div class="hint" style="margin-top:4px;">${when}</div>
