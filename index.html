@@ -491,6 +491,16 @@
   //   scorecard, only fetched when someone actually opens/downloads it.
   const SCORECARDS_INDEX_PATH = 'scorecards_index';
   const SCORECARDS_FILES_PATH = 'scorecards_files';
+  // Rolling checkpoint history of the live match — separate from
+  // MATCH_PATH (which is just the single latest state, overwritten on
+  // every push). Written at safe, meaningful moments (over completed,
+  // innings ended, match finished) so that if the app crashes, gets
+  // closed, or a bad state gets pushed to MATCH_PATH, the scorer can pull
+  // any of the last several checkpoints back down and continue instead
+  // of losing the match. Keeps only the newest MAX_CHECKPOINTS entries —
+  // older ones are pruned automatically after each write.
+  const CHECKPOINTS_PATH = 'match_checkpoints';
+  const MAX_CHECKPOINTS = 8;
   // Shared squad details (team names + player lists), so anyone with the
   // page link sees the latest squads, and anyone who's entered the PIN
   // can update them — no GitHub token required for this part.
@@ -731,6 +741,51 @@
       if(!snap.exists()) throw new Error('That scorecard is no longer available.');
       const { pdfBase64 } = snap.val();
       return base64ToBlob(pdfBase64, 'application/pdf');
+    },
+    // Writes one entry into the rolling checkpoint history — a full copy
+    // of the match state at a "safe" moment (over completed, innings
+    // ended, match finished), tagged with a short human-readable label
+    // and a timestamp. Fire-and-forget: never blocks or throws into the
+    // caller, since this runs inline with normal scoring and a slow/failed
+    // checkpoint write should never interrupt live scoring. No-ops if not
+    // signed in, same as push().
+    async saveCheckpoint(matchState, label){
+      if(!auth.currentUser) return;
+      try{
+        await authReady;
+        const idRef = push(ref(db, CHECKPOINTS_PATH));
+        await set(idRef, { state: matchState, label: label||'', savedAt: Date.now() });
+        // Prune anything beyond the newest MAX_CHECKPOINTS so this list
+        // never grows unbounded. Best-effort — a failed prune just means
+        // a few extra old entries linger, which is harmless.
+        const snap = await get(ref(db, CHECKPOINTS_PATH));
+        if(snap.exists()){
+          const val = snap.val();
+          const ids = Object.keys(val).sort((a,b)=> (val[a].savedAt||0) - (val[b].savedAt||0));
+          const toDelete = ids.slice(0, Math.max(0, ids.length - MAX_CHECKPOINTS));
+          await Promise.all(toDelete.map(id=> set(ref(db, CHECKPOINTS_PATH+'/'+id), null)));
+        }
+      }catch(e){
+        console.warn('LiveSync: saveCheckpoint failed:', e.message);
+      }
+    },
+    // Lists every stored checkpoint (newest first) — full match state
+    // included (these are lightweight JSON, no PDFs), so the caller can
+    // load one straight in without a second fetch. Works for viewers too
+    // (anonymous read), same as listScorecards().
+    async listCheckpoints(){
+      await ensureReadAccess();
+      try{
+        const snap = await get(ref(db, CHECKPOINTS_PATH));
+        if(!snap.exists()) return [];
+        const val = snap.val();
+        return Object.keys(val)
+          .map(id=> Object.assign({id}, val[id]))
+          .sort((a,b)=> (b.savedAt||0) - (a.savedAt||0));
+      }catch(e){
+        console.warn('LiveSync: listCheckpoints failed:', e.message);
+        return [];
+      }
     },
   };
 </script>
@@ -1002,6 +1057,18 @@ function loadState(){
 }
 function clearSavedState(){
   try{ localStorage.removeItem(STORAGE_KEY); }catch(e){}
+}
+/* Fires a checkpoint write to Firebase at a meaningful moment (over
+   done, innings done, match finished) — separate from the continuous
+   saveState()/LiveSync.push() that overwrites the single "current match"
+   slot on every render. This gives the scorer several rollback points to
+   choose from (via "Recover previous score") if the live match state
+   ever gets lost or corrupted, instead of only ever being able to resume
+   from whatever happened to be pushed last. Silently no-ops if Live
+   isn't on, in view mode, or LiveSync hasn't loaded yet. */
+function saveCheckpointNow(label){
+  if(VIEW_MODE || !window.LiveSync || !window.LiveSync.isSignedIn()) return;
+  window.LiveSync.saveCheckpoint(clone(M), label);
 }
 if(!loadState()) M = freshMatch();
 
@@ -1285,6 +1352,7 @@ function afterLegalBall(skipOverCheck){
     inn.bowlerId = null;
     inn.thisOverEvents = [];
     if(checkInningsEnd()){ render(); return; }
+    saveCheckpointNow('Over '+inn.oversCompleted+' complete — '+M.teamNames[inn.battingTeam]+' '+inn.totalRuns+'/'+inn.totalWkts);
     modal = {type:'newBowler'};
     render();
     return;
@@ -1311,10 +1379,12 @@ function checkInningsEnd(){
     undoStack = []; // don't let undo history leak across innings boundaries
     if(M.curInnIdx === 0){
       M.stage = 'between';
+      saveCheckpointNow('End of 1st innings — '+M.teamNames[inn.battingTeam]+' '+inn.totalRuns+'/'+inn.totalWkts);
     } else {
       M.stage = 'finished';
       computeResult();
       autoPushFinishedScorecardToFirebase();
+      saveCheckpointNow('Match finished — '+(M.resultText||''));
     }
   }
   return ended;
@@ -2020,6 +2090,14 @@ function renderTopbar(){
   pdfs.onclick=()=>{modal={type:'firebaseScorecards', loading:true, items:[]}; render(); loadFirebaseScorecardsIntoModal();};
   btnWrap.appendChild(pdfs);
 
+  // Recovery: pull any of the last several auto-saved checkpoints back
+  // down from Firebase (over-by-over / innings-by-innings snapshots) —
+  // for when the app crashed, got closed, or the live match state
+  // otherwise needs rolling back to continue scoring from.
+  const rec = document.createElement('button'); rec.className='iconbtn'; rec.textContent='⏮ Recover';
+  rec.onclick=()=>{modal={type:'recoverCheckpoints', loading:true, items:[]}; render(); loadCheckpointsIntoModal();};
+  btnWrap.appendChild(rec);
+
   const live = document.createElement('button'); live.className='iconbtn';
   const signedIn = window.LiveSync && window.LiveSync.isSignedIn();
   live.textContent = signedIn ? '🟢 Live' : '🔒 Live off';
@@ -2104,6 +2182,35 @@ async function loadFirebaseScorecardsIntoModal(){
     modal.items = items;
     render();
   }
+}
+
+/* Fetches the rolling checkpoint history (over-by-over / innings-by-
+   innings auto-saves) from Firebase in the background and refreshes the
+   "⏮ Recover" modal once they arrive. Same pattern as
+   loadFirebaseScorecardsIntoModal() above — safe to call even if the
+   modal gets closed/changed before the fetch finishes. */
+async function loadCheckpointsIntoModal(){
+  if(!window.LiveSync){
+    if(modal && modal.type==='recoverCheckpoints'){ modal.loading=false; modal.error='Live sync is still loading — try again in a second.'; render(); }
+    return;
+  }
+  const items = await window.LiveSync.listCheckpoints();
+  if(modal && modal.type==='recoverCheckpoints'){
+    modal.loading = false;
+    modal.items = items;
+    render();
+  }
+}
+
+/* Loads one checkpoint's saved match state onto this device and resumes
+   scoring from it — used by the "⏮ Recover" modal. Destructive to
+   whatever match is currently in progress on this device, so the caller
+   confirms first. */
+function loadCheckpoint(item){
+  M = normalizeMatch(item.state);
+  undoStack = [];
+  modal = null;
+  render();
 }
 
 /* Fetches one scorecard's PDF bytes from Firebase on demand (they're
@@ -3145,6 +3252,47 @@ function renderModal(){
     }
     const refresh = el('<button class="btn-ghost" style="margin-top:4px;">🔄 Refresh</button>');
     refresh.onclick = ()=>{ modal.loading=true; modal.error=null; render(); loadFirebaseScorecardsIntoModal(); };
+    m.appendChild(refresh);
+    const close = el('<button class="modal-close" style="margin-top:8px;">Close</button>');
+    close.onclick = ()=>{ modal=null; render(); };
+    m.appendChild(close);
+  }
+  else if(modal.type==='recoverCheckpoints'){
+    m.appendChild(el('<h3>⏮ Recover previous score</h3>'));
+    m.appendChild(el(`<p class="hint" style="margin-bottom:14px;">
+      Auto-saved checkpoints from this live match — one is saved after every over, after each
+      innings ends, and when the match finishes. If the app crashed, closed, or lost its state,
+      pick one below to load it onto this device and carry on scoring from there. This replaces
+      whatever match is currently on this device.
+    </p>`));
+    if(modal.loading){
+      m.appendChild(el('<p class="hint">Loading…</p>'));
+    } else if(modal.error){
+      m.appendChild(el(`<p class="hint" style="color:var(--red);">${modal.error}</p>`));
+    } else if(!modal.items || modal.items.length===0){
+      m.appendChild(el('<p class="hint">No checkpoints saved yet — these only start appearing once Live is turned on and at least one over is bowled.</p>'));
+    } else {
+      modal.items.forEach(item=>{
+        const when = item.savedAt ? new Date(item.savedAt).toLocaleString('en-GB',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
+        const state = item.state || {};
+        const teamLine = state.teamNames ? (state.teamNames.A+' vs '+state.teamNames.B) : '';
+        const row = el(`<div class="card" style="padding:12px 14px; margin-bottom:10px;">
+          ${teamLine ? `<div style="font-weight:600;">${teamLine}</div>` : ''}
+          <div class="hint" style="margin:2px 0 0;">${item.label||'Checkpoint'}</div>
+          <div class="hint" style="margin-top:4px;">${when}</div>
+        </div>`);
+        const load = el('<button class="btn-ghost" style="display:block; width:100%; text-align:center; margin-top:8px;">↩️ Load this and continue scoring</button>');
+        load.onclick = ()=>{
+          if(confirm('Load this checkpoint ('+(item.label||'checkpoint')+', '+when+')? Your current match on this device will be replaced.')){
+            loadCheckpoint(item);
+          }
+        };
+        row.appendChild(load);
+        m.appendChild(row);
+      });
+    }
+    const refresh = el('<button class="btn-ghost" style="margin-top:4px;">🔄 Refresh</button>');
+    refresh.onclick = ()=>{ modal.loading=true; modal.error=null; render(); loadCheckpointsIntoModal(); };
     m.appendChild(refresh);
     const close = el('<button class="modal-close" style="margin-top:8px;">Close</button>');
     close.onclick = ()=>{ modal=null; render(); };
