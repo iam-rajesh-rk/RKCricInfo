@@ -863,6 +863,12 @@ const STORAGE_KEY = 'crease_match_v1';
 const SQUADS_KEY  = 'crease_squads_v1';
 const PLAYER_LIBRARY_KEY = 'crease_player_library_v1';
 const GITHUB_SYNC_KEY = 'crease_github_sync_v1';
+// Holds a single-slot local backup of whatever match was on this device
+// right before a "⏮ Recover" load overwrote it — see backupCurrentMatch()
+// below. This is what lets a scorer switch back if they load the wrong
+// one, even when Firebase sync itself is the thing that's broken (so the
+// device's own in-progress match may not exist anywhere in Firebase yet).
+const RECOVER_BACKUP_KEY = 'crease_recover_backup_v1';
 
 /* ---- live viewer mode: ?view=1 on the URL means "read-only scoreboard" ---- */
 const VIEW_MODE = new URLSearchParams(location.search).get('view') === '1';
@@ -1118,6 +1124,33 @@ function loadState(){
 }
 function clearSavedState(){
   try{ localStorage.removeItem(STORAGE_KEY); }catch(e){}
+}
+/* Backs up whatever match is currently on this device into a single
+   local-only slot, right before a "⏮ Recover" load overwrites it. Purely
+   local (localStorage) — deliberately doesn't depend on Firebase, since
+   the whole point is to have a way back even when sync itself is broken.
+   Skips backing up a blank/not-yet-started match, since there'd be
+   nothing worth retaining. Overwrites any previous backup — this is a
+   single "one step back" slot, not a history. */
+function backupCurrentMatchBeforeRecover(){
+  if(!M || M.stage==='setup') return;
+  try{
+    localStorage.setItem(RECOVER_BACKUP_KEY, JSON.stringify({M: clone(M), undoStack, savedAt: Date.now()}));
+  }catch(e){}
+}
+/* Reads back the local backup saved by backupCurrentMatchBeforeRecover(),
+   or null if there isn't one. */
+function readRecoverBackup(){
+  try{
+    const raw = localStorage.getItem(RECOVER_BACKUP_KEY);
+    if(!raw) return null;
+    const parsed = JSON.parse(raw);
+    if(!parsed || !parsed.M) return null;
+    return parsed;
+  }catch(e){ return null; }
+}
+function clearRecoverBackup(){
+  try{ localStorage.removeItem(RECOVER_BACKUP_KEY); }catch(e){}
 }
 /* Fires a checkpoint write to Firebase at a meaningful moment (over
    done, innings done, match finished) — separate from the continuous
@@ -2270,8 +2303,23 @@ async function loadRecentMatchesIntoModal(){
    from it — used by the "⏮ Recover" modal. Destructive to whatever match
    is currently in progress on this device, so the caller confirms first. */
 function loadRecentMatch(item){
+  backupCurrentMatchBeforeRecover();
   M = normalizeMatch(item.state);
   undoStack = [];
+  modal = null;
+  render();
+}
+
+/* Restores the match that was on this device right before the last
+   "⏮ Recover" load — the one-step-back companion to loadRecentMatch()
+   above. Backs up the (now current, recovered) match first too, so
+   switching back and forth stays reversible either way. */
+function restoreRecoverBackup(){
+  const backup = readRecoverBackup();
+  if(!backup) return;
+  backupCurrentMatchBeforeRecover();
+  M = normalizeMatch(backup.M);
+  undoStack = backup.undoStack || [];
   modal = null;
   render();
 }
@@ -3349,7 +3397,8 @@ function renderModal(){
       The last 2 matches scored live from this account, each with its latest known score. If sync
       dropped and this device lost track of an innings, pick the right match below by its teams
       and score — instead of guessing — to load it back down and keep scoring. Loading a match
-      replaces whatever match is currently on this device.
+      replaces whatever match is currently on this device — but that gets backed up locally first,
+      so if you load the wrong one you can always switch back below.
     </p>`));
     if(modal.loading){
       m.appendChild(el('<p class="hint">Loading…</p>'));
@@ -3378,6 +3427,25 @@ function renderModal(){
         row.appendChild(load);
         m.appendChild(row);
       });
+    }
+    const backup = readRecoverBackup();
+    if(backup){
+      const when = backup.savedAt ? new Date(backup.savedAt).toLocaleString('en-GB',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
+      const teamLine = backup.M.teamNames ? (backup.M.teamNames.A+' vs '+backup.M.teamNames.B) : '';
+      const row = el(`<div class="card" style="padding:12px 14px; margin-bottom:10px; border-style:dashed;">
+        <div class="hint" style="margin:0 0 4px; text-transform:uppercase; letter-spacing:.03em; font-size:11px;">On this device before your last recovery</div>
+        ${teamLine ? `<div style="font-weight:600;">${teamLine}</div>` : ''}
+        <div class="hint" style="margin:2px 0 0;">${summarizeMatchState(backup.M)}</div>
+        <div class="hint" style="margin-top:4px;">Backed up: ${when}</div>
+      </div>`);
+      const load = el('<button class="btn-ghost" style="display:block; width:100%; text-align:center; margin-top:8px;">↩️ Switch back to this</button>');
+      load.onclick = ()=>{
+        if(confirm('Switch back to '+(teamLine||'this match')+'? Whatever is currently on this device will itself be backed up so you can switch again if needed.')){
+          restoreRecoverBackup();
+        }
+      };
+      row.appendChild(load);
+      m.appendChild(row);
     }
     const refresh = el('<button class="btn-ghost" style="margin-top:4px;">🔄 Refresh</button>');
     refresh.onclick = ()=>{ modal.loading=true; modal.error=null; render(); loadRecentMatchesIntoModal(); };
