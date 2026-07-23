@@ -501,6 +501,20 @@
   // older ones are pruned automatically after each write.
   const CHECKPOINTS_PATH = 'match_checkpoints';
   const MAX_CHECKPOINTS = 8;
+  // Rolling history of the last few *distinct matches* (keyed by the
+  // match's own matchId, not by over/innings like CHECKPOINTS_PATH above).
+  // Updated on every live push with that match's latest full state, so
+  // unlike the over-by-over checkpoints (which can all get pruned away
+  // within a single busy match, taking the previous match's checkpoints
+  // down with them), this always keeps the *most recent state of each of
+  // the last MAX_RECENT_MATCHES matches* — one slot per match, overwritten
+  // in place. This is what lets a scorer pick "the match before this one"
+  // and be confident it's still there, even after sync dropped mid-innings.
+  const RECENT_MATCHES_PATH = 'recent_matches';
+  const MAX_RECENT_MATCHES = 2;
+  // Only re-run the prune (which costs an extra read) when a genuinely new
+  // matchId shows up — not on every single-ball push.
+  let lastPushedMatchId = null;
   // Shared squad details (team names + player lists), so anyone with the
   // page link sees the latest squads, and anyone who's entered the PIN
   // can update them — no GitHub token required for this part.
@@ -574,6 +588,21 @@
     for(let i=0;i<byteChars.length;i++) byteNumbers[i] = byteChars.charCodeAt(i);
     return new Blob([new Uint8Array(byteNumbers)], {type: mimeType});
   }
+  // Keeps RECENT_MATCHES_PATH trimmed to the newest MAX_RECENT_MATCHES
+  // entries. Best-effort, same as the checkpoint pruning below — a failed
+  // prune just leaves a few extra old matches lingering, which is harmless.
+  async function pruneRecentMatches(){
+    try{
+      const snap = await get(ref(db, RECENT_MATCHES_PATH));
+      if(!snap.exists()) return;
+      const val = snap.val();
+      const ids = Object.keys(val).sort((a,b)=> (val[a].updatedAt||0) - (val[b].updatedAt||0));
+      const toDelete = ids.slice(0, Math.max(0, ids.length - MAX_RECENT_MATCHES));
+      await Promise.all(toDelete.map(id=> set(ref(db, RECENT_MATCHES_PATH+'/'+id), null)));
+    }catch(e){
+      console.warn('LiveSync: pruneRecentMatches failed:', e.message);
+    }
+  }
 
   window.LiveSync = {
     // Called after every render() on the scorer's device. Debounced so a
@@ -588,6 +617,18 @@
         set(ref(db, MATCH_PATH), matchState).catch(e=>{
           console.warn('LiveSync: push failed (probably not signed in):', e.message);
         });
+        const matchId = matchState && matchState.matchId;
+        if(matchId){
+          set(ref(db, RECENT_MATCHES_PATH+'/'+matchId), { state: matchState, updatedAt: Date.now() }).catch(e=>{
+            console.warn('LiveSync: recent-match push failed:', e.message);
+          });
+          // A new match showing up is the only time the list can grow past
+          // MAX_RECENT_MATCHES, so that's the only time it's worth pruning.
+          if(matchId !== lastPushedMatchId){
+            lastPushedMatchId = matchId;
+            pruneRecentMatches();
+          }
+        }
       }, 400);
     },
     // Pushes shared squad details (team names + player lists). Same PIN
@@ -787,6 +828,24 @@
         return [];
       }
     },
+    // Lists the last MAX_RECENT_MATCHES *distinct matches* (newest first),
+    // each with its own latest full state — see RECENT_MATCHES_PATH above
+    // for why this is more reliable than listCheckpoints() for "load the
+    // match before this one". Works for viewers too (anonymous read).
+    async listRecentMatches(){
+      await ensureReadAccess();
+      try{
+        const snap = await get(ref(db, RECENT_MATCHES_PATH));
+        if(!snap.exists()) return [];
+        const val = snap.val();
+        return Object.keys(val)
+          .map(id=> Object.assign({matchId:id}, val[id]))
+          .sort((a,b)=> (b.updatedAt||0) - (a.updatedAt||0));
+      }catch(e){
+        console.warn('LiveSync: listRecentMatches failed:', e.message);
+        return [];
+      }
+    },
   };
 </script>
 
@@ -812,6 +871,7 @@ let liveViewState = null; // populated by LiveSync.subscribe() when VIEW_MODE is
 
 function freshMatch(){
   return {
+    matchId: 'm'+Date.now().toString(36)+Math.random().toString(36).slice(2,8),
     teamNames:{A:'Team A', B:'Team B'},
     squads:{A:[], B:[]},
     oversPerInnings:[20,20],
@@ -1023,6 +1083,7 @@ function normalizeMatch(m){
   const base = freshMatch();
   if(!m || typeof m !== 'object') return base;
   const out = Object.assign({}, base, m);
+  out.matchId = (typeof m.matchId === 'string' && m.matchId) ? m.matchId : base.matchId;
   out.teamNames = Object.assign({}, base.teamNames, (m.teamNames && typeof m.teamNames==='object') ? m.teamNames : {});
   out.squads = Object.assign({}, base.squads, (m.squads && typeof m.squads==='object') ? m.squads : {});
   out.toss = Object.assign({}, base.toss, (m.toss && typeof m.toss==='object') ? m.toss : {});
@@ -1061,11 +1122,11 @@ function clearSavedState(){
 /* Fires a checkpoint write to Firebase at a meaningful moment (over
    done, innings done, match finished) — separate from the continuous
    saveState()/LiveSync.push() that overwrites the single "current match"
-   slot on every render. This gives the scorer several rollback points to
-   choose from (via "Recover previous score") if the live match state
-   ever gets lost or corrupted, instead of only ever being able to resume
-   from whatever happened to be pushed last. Silently no-ops if Live
-   isn't on, in view mode, or LiveSync hasn't loaded yet. */
+   slot on every render, and separate from the per-match "recent_matches"
+   history that now powers the "⏮ Recover" modal (see RECENT_MATCHES_PATH
+   in the LiveSync module). Kept as an extra rollback safety margin behind
+   the scenes. Silently no-ops if Live isn't on, in view mode, or LiveSync
+   hasn't loaded yet. */
 function saveCheckpointNow(label){
   if(VIEW_MODE || !window.LiveSync || !window.LiveSync.isSignedIn()) return;
   window.LiveSync.saveCheckpoint(clone(M), label);
@@ -2090,12 +2151,12 @@ function renderTopbar(){
   pdfs.onclick=()=>{modal={type:'firebaseScorecards', loading:true, items:[]}; render(); loadFirebaseScorecardsIntoModal();};
   btnWrap.appendChild(pdfs);
 
-  // Recovery: pull any of the last several auto-saved checkpoints back
-  // down from Firebase (over-by-over / innings-by-innings snapshots) —
-  // for when the app crashed, got closed, or the live match state
-  // otherwise needs rolling back to continue scoring from.
+  // Recovery: pull the last couple of *distinct matches* back down from
+  // Firebase (each one's latest known score), so if sync drops mid-match
+  // (e.g. lost the 2nd innings) the scorer can clearly pick which match
+  // to resume — instead of loading the wrong game by mistake.
   const rec = document.createElement('button'); rec.className='iconbtn'; rec.textContent='⏮ Recover';
-  rec.onclick=()=>{modal={type:'recoverCheckpoints', loading:true, items:[]}; render(); loadCheckpointsIntoModal();};
+  rec.onclick=()=>{modal={type:'recoverMatches', loading:true, items:[]}; render(); loadRecentMatchesIntoModal();};
   btnWrap.appendChild(rec);
 
   const live = document.createElement('button'); live.className='iconbtn';
@@ -2184,39 +2245,52 @@ async function loadFirebaseScorecardsIntoModal(){
   }
 }
 
-/* Fetches the rolling checkpoint history (over-by-over / innings-by-
-   innings auto-saves) from Firebase in the background and refreshes the
+/* Fetches the last couple of distinct live-scored matches (each one's
+   latest known state, keyed by matchId — see RECENT_MATCHES_PATH in the
+   LiveSync module) from Firebase in the background and refreshes the
    "⏮ Recover" modal once they arrive. Same pattern as
    loadFirebaseScorecardsIntoModal() above — safe to call even if the
    modal gets closed/changed before the fetch finishes. */
-async function loadCheckpointsIntoModal(){
+async function loadRecentMatchesIntoModal(){
   if(!window.LiveSync){
-    if(modal && modal.type==='recoverCheckpoints'){ modal.loading=false; modal.error='Live sync is still loading — try again in a second.'; render(); }
+    if(modal && modal.type==='recoverMatches'){ modal.loading=false; modal.error='Live sync is still loading — try again in a second.'; render(); }
     return;
   }
-  const items = await window.LiveSync.listCheckpoints();
-  if(modal && modal.type==='recoverCheckpoints'){
+  const items = await window.LiveSync.listRecentMatches();
+  if(modal && modal.type==='recoverMatches'){
     modal.loading = false;
-    // Only the 2 most recent are shown — this is specifically for the
-    // "oops, ended the innings/match by mistake" case: the newest entry
-    // is almost always the mistake itself, and the one right before it is
-    // the last good state to jump back to. (Firebase still keeps a few
-    // more than 2 behind the scenes as extra safety margin, but surfacing
-    // all of them here just adds noise for this use case.)
+    // Newest first — the current/most recent match, then the one before
+    // it. Only 2 are ever stored server-side, but slice defensively.
     modal.items = items.slice(0, 2);
     render();
   }
 }
 
-/* Loads one checkpoint's saved match state onto this device and resumes
-   scoring from it — used by the "⏮ Recover" modal. Destructive to
-   whatever match is currently in progress on this device, so the caller
-   confirms first. */
-function loadCheckpoint(item){
+/* Loads one match's saved state onto this device and resumes scoring
+   from it — used by the "⏮ Recover" modal. Destructive to whatever match
+   is currently in progress on this device, so the caller confirms first. */
+function loadRecentMatch(item){
   M = normalizeMatch(item.state);
   undoStack = [];
   modal = null;
   render();
+}
+
+/* Short one-line summary of a match's current score/stage, used in the
+   "⏮ Recover" modal to tell two matches apart at a glance without
+   needing to open either one first. */
+function summarizeMatchState(state){
+  if(!state || state.stage==='setup' || !Array.isArray(state.innings) || !state.innings.length){
+    return 'Not yet started';
+  }
+  const inn = state.innings[state.innings.length-1];
+  if(!inn) return '';
+  const battingName = (state.teamNames && state.teamNames[inn.battingTeam]) || 'Batting team';
+  const scoreLine = battingName+' '+(inn.totalRuns||0)+'/'+(inn.totalWkts||0)+' ('+oversStr(inn)+' ov)';
+  const stageLine = state.stage==='finished'
+    ? (state.resultText || 'Match finished')
+    : (state.innings.length>1 ? '2nd innings in progress' : '1st innings in progress');
+  return scoreLine+' — '+stageLine;
 }
 
 /* Fetches one scorecard's PDF bytes from Firebase on demand (they're
@@ -3269,36 +3343,36 @@ function renderModal(){
     close.onclick = ()=>{ modal=null; render(); };
     m.appendChild(close);
   }
-  else if(modal.type==='recoverCheckpoints'){
-    m.appendChild(el('<h3>⏮ Recover previous score</h3>'));
+  else if(modal.type==='recoverMatches'){
+    m.appendChild(el('<h3>⏮ Recover a live match</h3>'));
     m.appendChild(el(`<p class="hint" style="margin-bottom:14px;">
-      The last 2 auto-saved checkpoints for this match — one is saved after every over, after each
-      innings ends, and when the match finishes. Ended an innings or the match by mistake? The
-      newest entry below is usually that mistake — pick the one above it to jump back and carry
-      on scoring. Loading a checkpoint replaces whatever match is currently on this device.
+      The last 2 matches scored live from this account, each with its latest known score. If sync
+      dropped and this device lost track of an innings, pick the right match below by its teams
+      and score — instead of guessing — to load it back down and keep scoring. Loading a match
+      replaces whatever match is currently on this device.
     </p>`));
     if(modal.loading){
       m.appendChild(el('<p class="hint">Loading…</p>'));
     } else if(modal.error){
       m.appendChild(el(`<p class="hint" style="color:var(--red);">${modal.error}</p>`));
     } else if(!modal.items || modal.items.length===0){
-      m.appendChild(el('<p class="hint">No checkpoints saved yet — these only start appearing once Live is turned on and at least one over is bowled.</p>'));
+      m.appendChild(el('<p class="hint">No live matches saved yet — these only start appearing once Live is turned on and scoring begins.</p>'));
     } else {
       modal.items.forEach((item, idx)=>{
-        const when = item.savedAt ? new Date(item.savedAt).toLocaleString('en-GB',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
+        const when = item.updatedAt ? new Date(item.updatedAt).toLocaleString('en-GB',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
         const state = item.state || {};
         const teamLine = state.teamNames ? (state.teamNames.A+' vs '+state.teamNames.B) : '';
-        const tag = idx===0 ? 'Latest' : 'Previous';
+        const tag = idx===0 ? 'Most recent' : 'Previous match';
         const row = el(`<div class="card" style="padding:12px 14px; margin-bottom:10px;">
           <div class="hint" style="margin:0 0 4px; text-transform:uppercase; letter-spacing:.03em; font-size:11px;">${tag}</div>
           ${teamLine ? `<div style="font-weight:600;">${teamLine}</div>` : ''}
-          <div class="hint" style="margin:2px 0 0;">${item.label||'Checkpoint'}</div>
-          <div class="hint" style="margin-top:4px;">${when}</div>
+          <div class="hint" style="margin:2px 0 0;">${summarizeMatchState(state)}</div>
+          <div class="hint" style="margin-top:4px;">Last updated: ${when}</div>
         </div>`);
         const load = el('<button class="btn-ghost" style="display:block; width:100%; text-align:center; margin-top:8px;">↩️ Load this and continue scoring</button>');
         load.onclick = ()=>{
-          if(confirm('Load this checkpoint ('+(item.label||'checkpoint')+', '+when+')? Your current match on this device will be replaced.')){
-            loadCheckpoint(item);
+          if(confirm('Load '+(teamLine||'this match')+' ('+when+')? Your current match on this device will be replaced.')){
+            loadRecentMatch(item);
           }
         };
         row.appendChild(load);
@@ -3306,7 +3380,7 @@ function renderModal(){
       });
     }
     const refresh = el('<button class="btn-ghost" style="margin-top:4px;">🔄 Refresh</button>');
-    refresh.onclick = ()=>{ modal.loading=true; modal.error=null; render(); loadCheckpointsIntoModal(); };
+    refresh.onclick = ()=>{ modal.loading=true; modal.error=null; render(); loadRecentMatchesIntoModal(); };
     m.appendChild(refresh);
     const close = el('<button class="modal-close" style="margin-top:8px;">Close</button>');
     close.onclick = ()=>{ modal=null; render(); };
